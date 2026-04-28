@@ -110,7 +110,16 @@ function logLevelColor(string $level): string {
     };
 }
 
-// Derived stats
+// ── Alert engine ─────────────────────────────────────────────────────────────
+// Each alert: ['level' => 'critical'|'warning'|'info', 'category' => string, 'msg' => string]
+$alerts = [];
+
+function alert(string $level, string $category, string $msg): void {
+    global $alerts;
+    $alerts[] = ['level' => $level, 'category' => $category, 'msg' => $msg];
+}
+
+// ── Derived stats
 $cpuLoad  = (int) ($resource['cpu-load']    ?? 0);
 $memTotal = (int) ($resource['total-memory'] ?? 0);
 $memFree  = (int) ($resource['free-memory']  ?? 0);
@@ -127,6 +136,132 @@ $uptime        = e($resource['uptime']  ?? '—');
 $boardModel    = e($board['model']      ?? $resource['board-name'] ?? '—');
 $architecture  = e($resource['architecture-name'] ?? '—');
 $connectedAt   = date('Y-m-d H:i:s');
+
+// ── Generate alerts ───────────────────────────────────────────────────────────
+
+// Connectivity
+if (!mtOk($resource)) {
+    alert('critical', 'System', 'Router unreachable: ' . mtErr($resource));
+}
+
+// CPU
+if ($cpuLoad >= 90) alert('critical', 'CPU',    "CPU load critical: {$cpuLoad}%");
+elseif ($cpuLoad >= 70) alert('warning', 'CPU', "CPU load high: {$cpuLoad}%");
+
+// Memory
+if ($memPct >= 90) alert('critical', 'Memory',    "Memory usage critical: {$memPct}% ({$memUsed}/{$memTotal} bytes)");
+elseif ($memPct >= 75) alert('warning', 'Memory', "Memory usage high: {$memPct}%");
+
+// Storage
+if ($hddPct >= 90) alert('critical', 'Storage',    "Disk usage critical: {$hddPct}%");
+elseif ($hddPct >= 80) alert('warning', 'Storage', "Disk usage high: {$hddPct}%");
+
+// Temperature
+$tempVal = null;
+if (mtOk($health)) {
+    foreach ((array)$health as $item) {
+        if (isset($item['name']) && str_contains(strtolower($item['name']), 'temperature')) {
+            $tempVal = (int)($item['value'] ?? 0); break;
+        }
+    }
+    if ($tempVal === null && isset($health['temperature'])) $tempVal = (int)$health['temperature'];
+}
+if ($tempVal !== null) {
+    if ($tempVal >= 75) alert('critical', 'Temperature', "Router temperature critical: {$tempVal}°C");
+    elseif ($tempVal >= 60) alert('warning', 'Temperature', "Router temperature high: {$tempVal}°C");
+}
+
+// Interfaces: down (not disabled) + TX/RX errors/drops
+if (mtOk($ifaces)) {
+    foreach ($ifaces as $iface) {
+        $name     = $iface['name'] ?? '?';
+        $running  = ($iface['running']  ?? 'false') === 'true';
+        $disabled = ($iface['disabled'] ?? 'false') === 'true';
+        if (!$disabled && !$running) {
+            alert('warning', 'Interface', "Interface '{$name}' is DOWN");
+        }
+        $txErr = (int)($iface['tx-error'] ?? 0);
+        $rxErr = (int)($iface['rx-error'] ?? 0);
+        $txDrp = (int)($iface['tx-drop']  ?? 0);
+        $rxDrp = (int)($iface['rx-drop']  ?? 0);
+        if ($txErr > 0) alert('warning', 'Interface', "'{$name}': " . number_format($txErr) . " TX error(s)");
+        if ($rxErr > 0) alert('warning', 'Interface', "'{$name}': " . number_format($rxErr) . " RX error(s)");
+        if ($txDrp > 0) alert('info',    'Interface', "'{$name}': " . number_format($txDrp) . " TX drop(s)");
+        if ($rxDrp > 0) alert('info',    'Interface', "'{$name}': " . number_format($rxDrp) . " RX drop(s)");
+    }
+}
+
+// DHCP pool capacity (computed later in parsePoolRanges — placeholder, filled below)
+// We pre-compute here so alerts appear before the pool section renders
+function parsePoolRanges(string $ranges): array
+{
+    $total = 0; $parts = [];
+    foreach (explode(',', $ranges) as $range) {
+        $range = trim($range);
+        if (str_contains($range, '-')) {
+            [$start, $end] = explode('-', $range, 2);
+            $count = ip2long(trim($end)) - ip2long(trim($start)) + 1;
+            if ($count > 0) { $total += $count; $parts[] = ['start' => trim($start), 'end' => trim($end), 'count' => $count]; }
+        } else { $total++; $parts[] = ['start' => $range, 'end' => $range, 'count' => 1]; }
+    }
+    return ['ranges' => $parts, 'total' => $total];
+}
+
+$poolInfo    = [];
+$serverPool  = [];
+$leasesPerPool = [];
+
+if (mtOk($dhcpPool)) {
+    foreach ($dhcpPool as $pool) {
+        $name = $pool['name'] ?? ''; $ranges = $pool['ranges'] ?? '';
+        if ($name === '' || $ranges === '') continue;
+        $parsed = parsePoolRanges($ranges);
+        $poolInfo[$name] = ['ranges' => $parsed['ranges'], 'total' => $parsed['total'], 'rawRange' => $ranges];
+    }
+}
+if (mtOk($dhcpServer)) {
+    foreach ($dhcpServer as $srv) { $serverPool[$srv['name'] ?? ''] = $srv['address-pool'] ?? ''; }
+}
+if (mtOk($dhcpLease)) {
+    $leasesPerServer = [];
+    foreach ($dhcpLease as $lease) {
+        if (($lease['status'] ?? '') !== 'bound') continue;
+        $srv = $lease['server'] ?? '';
+        $leasesPerServer[$srv] = ($leasesPerServer[$srv] ?? 0) + 1;
+    }
+    foreach ($leasesPerServer as $srv => $cnt) {
+        $pool = $serverPool[$srv] ?? $srv;
+        $leasesPerPool[$pool] = ($leasesPerPool[$pool] ?? 0) + $cnt;
+    }
+}
+foreach ($poolInfo as $pName => $pInfo) {
+    $pTotal = $pInfo['total'];
+    $pUsed  = $leasesPerPool[$pName] ?? 0;
+    $pPct   = $pTotal > 0 ? round($pUsed / $pTotal * 100) : 0;
+    $pFree  = max(0, $pTotal - $pUsed);
+    if ($pPct >= 90) alert('critical', 'DHCP Pool', "Pool '{$pName}' is {$pPct}% full — only {$pFree} IP(s) remaining");
+    elseif ($pPct >= 75) alert('warning', 'DHCP Pool', "Pool '{$pName}' is {$pPct}% full — {$pFree} IP(s) remaining");
+}
+
+// Error/warning log entries (up to 10 most recent)
+$logAlerts = [];
+if (mtOk($log)) {
+    foreach (array_reverse($log) as $entry) {
+        $topics = strtolower($entry['topics'] ?? '');
+        if (str_contains($topics, 'critical') || str_contains($topics, 'error')) {
+            $logAlerts[] = ['level' => 'critical', 'topics' => $entry['topics'] ?? '', 'msg' => $entry['message'] ?? '', 'time' => $entry['time'] ?? ''];
+        } elseif (str_contains($topics, 'warning')) {
+            $logAlerts[] = ['level' => 'warning', 'topics' => $entry['topics'] ?? '', 'msg' => $entry['message'] ?? '', 'time' => $entry['time'] ?? ''];
+        }
+        if (count($logAlerts) >= 10) break;
+    }
+}
+
+// Count by level
+$critCount = count(array_filter($alerts, fn($a) => $a['level'] === 'critical'));
+$warnCount = count(array_filter($alerts, fn($a) => $a['level'] === 'warning'));
+$infoCount = count(array_filter($alerts, fn($a) => $a['level'] === 'info'));
+$totalAlerts = $critCount + $warnCount + $infoCount + count($logAlerts);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -250,6 +385,39 @@ $connectedAt   = date('Y-m-d H:i:s');
         /* Error */
         .error-box { background: #1f0d0d; border: 1px solid #6e1a1a; border-radius: 8px; padding: .65rem 1rem; color: #f85149; font-size: .8rem; margin-bottom: .5rem; }
 
+        /* Alerts panel */
+        .alert-panel { border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 1.25rem; overflow: hidden; }
+        .alert-panel-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: .7rem 1.1rem; background: var(--surface2);
+            border-bottom: 1px solid var(--border); cursor: pointer; user-select: none;
+        }
+        .alert-panel-header h3 { font-size: .9rem; font-weight: 700; display: flex; align-items: center; gap: .5rem; }
+        .alert-panel-body { background: var(--surface); }
+        .alert-row {
+            display: flex; align-items: flex-start; gap: .75rem;
+            padding: .55rem 1.1rem; border-bottom: 1px solid #1c2333; font-size: .82rem;
+        }
+        .alert-row:last-child { border-bottom: none; }
+        .alert-row.critical { border-left: 3px solid #f85149; }
+        .alert-row.warning  { border-left: 3px solid #d29922; }
+        .alert-row.info     { border-left: 3px solid #58a6ff; }
+        .alert-icon  { font-size: 1rem; margin-top: .05rem; flex-shrink: 0; }
+        .alert-cat   { min-width: 100px; font-weight: 600; font-size: .75rem; }
+        .alert-cat.critical { color: #f85149; }
+        .alert-cat.warning  { color: #d29922; }
+        .alert-cat.info     { color: #58a6ff; }
+        .alert-msg   { color: var(--text); flex: 1; }
+        .alert-time  { color: var(--muted); font-size: .72rem; white-space: nowrap; }
+        .alert-count-badge {
+            display: inline-flex; align-items: center; justify-content: center;
+            min-width: 22px; height: 22px; border-radius: 999px; font-size: .72rem; font-weight: 700; padding: 0 .4rem;
+        }
+        .acb-red    { background: #6e1a1a; color: #f85149; }
+        .acb-amber  { background: #7a4f00; color: #d29922; }
+        .acb-blue   { background: #0d2040; color: #58a6ff; }
+        .acb-green  { background: #0d1f0f; color: #3fb950; }
+
         .section-gap { margin-bottom: 1.25rem; }
 
         .updated { font-size: .72rem; color: var(--muted); text-align: right; margin-top: .5rem; }
@@ -277,6 +445,13 @@ $connectedAt   = date('Y-m-d H:i:s');
         <span class="badge badge-blue">⏱ <?= $uptime ?></span>
         <?php else: ?>
         <span class="badge badge-red">● Unreachable</span>
+        <?php endif; ?>
+        <?php if ($critCount > 0): ?>
+        <span class="badge badge-red">⚠️ <?= $critCount ?> critical</span>
+        <?php elseif ($warnCount > 0): ?>
+        <span class="badge" style="background:#1f1500;color:#d29922;border:1px solid #7a4f00;">⚠️ <?= $warnCount ?> warning</span>
+        <?php elseif ($totalAlerts === 0): ?>
+        <span class="badge badge-green">✓ No alerts</span>
         <?php endif; ?>
 
         <form class="refresh-form" method="GET">
@@ -390,12 +565,7 @@ $connectedAt   = date('Y-m-d H:i:s');
                 if (($l['status'] ?? '') === 'bound') $activeLeases++;
             }
         }
-        if (mtOk($dhcpPool)) {
-            foreach ($dhcpPool as $p) {
-                $parsed = parsePoolRanges($p['ranges'] ?? '');
-                $totalPoolIPs += $parsed['total'];
-            }
-        }
+        foreach ($poolInfo as $pInfo) { $totalPoolIPs += $pInfo['total']; }
         $poolPct = $totalPoolIPs > 0 ? (int) round($activeLeases / $totalPoolIPs * 100) : 0;
         ?>
         <div class="stat-value" style="color:<?= $poolPct >= 90 ? '#f85149' : ($poolPct >= 75 ? '#d29922' : '#3fb950') ?>"><?= $activeLeases ?></div>
@@ -410,6 +580,78 @@ $connectedAt   = date('Y-m-d H:i:s');
         </div>
     </div>
 
+    <!-- Alert summary tile -->
+    <div class="stat-tile" style="<?= $critCount > 0 ? 'border-color:#6e1a1a;background:#1f0d0d;' : ($warnCount > 0 ? 'border-color:#7a4f00;background:#1f1500;' : 'border-color:#238636;background:#0d1f0f;') ?>">
+        <div class="stat-label">Alerts</div>
+        <div class="stat-value" style="color:<?= $critCount > 0 ? '#f85149' : ($warnCount > 0 ? '#d29922' : '#3fb950') ?>">
+            <?= $totalAlerts ?>
+        </div>
+        <div class="stat-sub">
+            <?php if ($totalAlerts === 0): ?>
+            ✅ All clear
+            <?php else: ?>
+            <?= $critCount > 0 ? "{$critCount} critical &bull; " : '' ?><?= $warnCount > 0 ? "{$warnCount} warning" : '' ?><?= $infoCount > 0 ? " &bull; {$infoCount} info" : '' ?>
+            <?php endif; ?>
+        </div>
+    </div>
+
+</div>
+
+<!-- ── Errors & Alerts ───────────────────────────────────────────────────── -->
+<div class="alert-panel">
+    <div class="alert-panel-header" onclick="toggleAlerts()">
+        <h3>
+            ⚠️ Errors &amp; Alerts
+            <?php if ($critCount > 0): ?>
+            <span class="alert-count-badge acb-red"><?= $critCount ?> critical</span>
+            <?php endif; ?>
+            <?php if ($warnCount > 0): ?>
+            <span class="alert-count-badge acb-amber"><?= $warnCount ?> warning</span>
+            <?php endif; ?>
+            <?php if ($infoCount > 0): ?>
+            <span class="alert-count-badge acb-blue"><?= $infoCount ?> info</span>
+            <?php endif; ?>
+            <?php if ($totalAlerts === 0 && empty($logAlerts)): ?>
+            <span class="alert-count-badge acb-green">✓ All clear</span>
+            <?php endif; ?>
+        </h3>
+        <span id="alertToggleIcon" style="color:var(--muted);font-size:.82rem;">▲ collapse</span>
+    </div>
+    <div class="alert-panel-body" id="alertPanelBody">
+        <?php if (empty($alerts) && empty($logAlerts)): ?>
+        <div class="alert-row info" style="border-left-color:#3fb950;">
+            <span class="alert-icon">✅</span>
+            <span class="alert-cat" style="color:#3fb950;">System</span>
+            <span class="alert-msg">No errors or warnings detected.</span>
+        </div>
+        <?php endif; ?>
+
+        <?php foreach ($alerts as $a):
+            $icon = match($a['level']) { 'critical' => '🔴', 'warning' => '🟡', default => '🔵' };
+        ?>
+        <div class="alert-row <?= e($a['level']) ?>">
+            <span class="alert-icon"><?= $icon ?></span>
+            <span class="alert-cat <?= e($a['level']) ?>"><?= e($a['category']) ?></span>
+            <span class="alert-msg"><?= e($a['msg']) ?></span>
+        </div>
+        <?php endforeach; ?>
+
+        <?php if (!empty($logAlerts)): ?>
+        <div style="padding:.4rem 1.1rem .2rem;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);background:var(--surface2);border-top:1px solid var(--border);border-bottom:1px solid var(--border);">
+            Log Errors / Warnings (last 10)
+        </div>
+        <?php foreach ($logAlerts as $la):
+            $icon = $la['level'] === 'critical' ? '🔴' : '🟡';
+        ?>
+        <div class="alert-row <?= e($la['level']) ?>">
+            <span class="alert-icon"><?= $icon ?></span>
+            <span class="alert-cat <?= e($la['level']) ?>"><?= e($la['topics']) ?></span>
+            <span class="alert-msg"><?= e($la['msg']) ?></span>
+            <span class="alert-time"><?= e($la['time']) ?></span>
+        </div>
+        <?php endforeach; ?>
+        <?php endif; ?>
+    </div>
 </div>
 
 <!-- ── Interfaces ────────────────────────────────────────────────────────── -->
@@ -425,18 +667,26 @@ $connectedAt   = date('Y-m-d H:i:s');
                 <th>Name</th>
                 <th>Type</th>
                 <th>MAC Address</th>
-                <th style="text-align:right">TX</th>
-                <th style="text-align:right">RX</th>
-                <th style="text-align:right">TX Packets</th>
-                <th style="text-align:right">RX Packets</th>
+                <th style="text-align:right">TX Bytes</th>
+                <th style="text-align:right">RX Bytes</th>
+                <th style="text-align:right">TX Pkts</th>
+                <th style="text-align:right">RX Pkts</th>
+                <th style="text-align:right;color:#f85149">TX Err</th>
+                <th style="text-align:right;color:#f85149">RX Err</th>
+                <th style="text-align:right;color:#d29922">TX Drop</th>
+                <th style="text-align:right;color:#d29922">RX Drop</th>
                 <th>MTU</th>
             </tr>
         </thead>
         <tbody>
         <?php foreach ($ifaces as $iface):
-            $running  = ($iface['running'] ?? 'false') === 'true';
+            $running  = ($iface['running']  ?? 'false') === 'true';
             $disabled = ($iface['disabled'] ?? 'false') === 'true';
             $dotClass = $disabled ? 'dot-gray' : ($running ? 'dot-green' : 'dot-red');
+            $txErr = (int)($iface['tx-error'] ?? 0);
+            $rxErr = (int)($iface['rx-error'] ?? 0);
+            $txDrp = (int)($iface['tx-drop']  ?? 0);
+            $rxDrp = (int)($iface['rx-drop']  ?? 0);
         ?>
         <tr>
             <td><span class="<?= $dotClass ?>"></span><?= $disabled ? '<span class="tag">disabled</span>' : ($running ? '<span class="tag tag-green">up</span>' : '<span class="tag tag-red">down</span>') ?></td>
@@ -447,6 +697,10 @@ $connectedAt   = date('Y-m-d H:i:s');
             <td style="text-align:right"><?= fmtBytes($iface['rx-byte'] ?? 0) ?></td>
             <td style="text-align:right"><?= number_format((int)($iface['tx-packet'] ?? 0)) ?></td>
             <td style="text-align:right"><?= number_format((int)($iface['rx-packet'] ?? 0)) ?></td>
+            <td style="text-align:right;<?= $txErr > 0 ? 'color:#f85149;font-weight:700;' : 'color:var(--muted)' ?>"><?= $txErr > 0 ? number_format($txErr) : '—' ?></td>
+            <td style="text-align:right;<?= $rxErr > 0 ? 'color:#f85149;font-weight:700;' : 'color:var(--muted)' ?>"><?= $rxErr > 0 ? number_format($rxErr) : '—' ?></td>
+            <td style="text-align:right;<?= $txDrp > 0 ? 'color:#d29922;font-weight:700;' : 'color:var(--muted)' ?>"><?= $txDrp > 0 ? number_format($txDrp) : '—' ?></td>
+            <td style="text-align:right;<?= $rxDrp > 0 ? 'color:#d29922;font-weight:700;' : 'color:var(--muted)' ?>"><?= $rxDrp > 0 ? number_format($rxDrp) : '—' ?></td>
             <td><?= e((string)($iface['mtu'] ?? '—')) ?></td>
         </tr>
         <?php endforeach; ?>
@@ -524,74 +778,7 @@ $connectedAt   = date('Y-m-d H:i:s');
 <!-- ── DHCP Pool Capacity ─────────────────────────────────────────────────── -->
 <div class="card section-gap">
     <div class="card-title"><span class="dot"></span> DHCP Pool Capacity</div>
-    <?php
-    /**
-     * Build a map: pool-name → [ranges, total IPs]
-     * Then cross-reference with servers and leases to compute used/free.
-     */
-    function parsePoolRanges(string $ranges): array
-    {
-        // ranges may be comma-separated: "192.168.50.10-192.168.50.100,192.168.50.150-192.168.50.200"
-        $total = 0;
-        $parts = [];
-        foreach (explode(',', $ranges) as $range) {
-            $range = trim($range);
-            if (str_contains($range, '-')) {
-                [$start, $end] = explode('-', $range, 2);
-                $count = ip2long(trim($end)) - ip2long(trim($start)) + 1;
-                if ($count > 0) {
-                    $total += $count;
-                    $parts[] = ['start' => trim($start), 'end' => trim($end), 'count' => $count];
-                }
-            } else {
-                $total++;
-                $parts[] = ['start' => $range, 'end' => $range, 'count' => 1];
-            }
-        }
-        return ['ranges' => $parts, 'total' => $total];
-    }
-
-    // Build pool info indexed by pool name
-    $poolInfo = [];
-    if (mtOk($dhcpPool)) {
-        foreach ($dhcpPool as $pool) {
-            $name   = $pool['name'] ?? '';
-            $ranges = $pool['ranges'] ?? '';
-            if ($name === '' || $ranges === '') continue;
-            $parsed = parsePoolRanges($ranges);
-            $poolInfo[$name] = [
-                'ranges'   => $parsed['ranges'],
-                'total'    => $parsed['total'],
-                'rawRange' => $ranges,
-            ];
-        }
-    }
-
-    // Map DHCP server → pool name
-    $serverPool = [];
-    if (mtOk($dhcpServer)) {
-        foreach ($dhcpServer as $srv) {
-            $serverPool[$srv['name'] ?? ''] = $srv['address-pool'] ?? '';
-        }
-    }
-
-    // Count bound leases per server
-    $leasesPerServer = [];
-    $leasesPerPool   = [];
-    if (mtOk($dhcpLease)) {
-        foreach ($dhcpLease as $lease) {
-            if (($lease['status'] ?? '') !== 'bound') continue;
-            $srv = $lease['server'] ?? '';
-            $leasesPerServer[$srv] = ($leasesPerServer[$srv] ?? 0) + 1;
-        }
-        // Translate server → pool
-        foreach ($leasesPerServer as $srv => $cnt) {
-            $pool = $serverPool[$srv] ?? $srv;
-            $leasesPerPool[$pool] = ($leasesPerPool[$pool] ?? 0) + $cnt;
-        }
-    }
-
-    if (empty($poolInfo)): ?>
+    <?php if (empty($poolInfo)): ?>
     <div class="error-box">No DHCP pools found<?= !mtOk($dhcpPool) ? ': ' . e(mtErr($dhcpPool)) : '' ?></div>
     <?php else:
         foreach ($poolInfo as $poolName => $info):
@@ -599,10 +786,9 @@ $connectedAt   = date('Y-m-d H:i:s');
             $used   = $leasesPerPool[$poolName] ?? 0;
             $free   = max(0, $total - $used);
             $pct    = $total > 0 ? round($used / $total * 100) : 0;
-            $barColor = $pct >= 90 ? '#f85149' : ($pct >= 75 ? '#d29922' : '#3fb950');
-            $status   = $pct >= 90 ? 'CRITICAL' : ($pct >= 75 ? 'WARNING' : 'OK');
-            $statusCls = $pct >= 90 ? 'tag-red' : ($pct >= 75 ? '' : 'tag-green');
-            // Linked DHCP server name(s)
+            $barColor  = $pct >= 90 ? '#f85149' : ($pct >= 75 ? '#d29922' : '#3fb950');
+            $status    = $pct >= 90 ? 'CRITICAL' : ($pct >= 75 ? 'WARNING' : 'OK');
+            $statusCls = $pct >= 90 ? 'tag-red'  : ($pct >= 75 ? ''        : 'tag-green');
             $linkedServers = array_keys(array_filter($serverPool, fn($p) => $p === $poolName));
     ?>
         <div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:1rem 1.1rem;margin-bottom:.75rem;">
@@ -747,5 +933,16 @@ $connectedAt   = date('Y-m-d H:i:s');
 <div class="updated">Last fetched: <?= $connectedAt ?><?= $refreshSec > 0 ? " &bull; Auto-refresh every {$refreshSec}s" : '' ?></div>
 
 </div><!-- /.container -->
+<script>
+    function toggleAlerts() {
+        const body = document.getElementById('alertPanelBody');
+        const icon = document.getElementById('alertToggleIcon');
+        const hidden = body.style.display === 'none';
+        body.style.display = hidden ? '' : 'none';
+        icon.textContent = hidden ? '▲ collapse' : '▼ expand';
+    }
+    // Auto-expand if there are critical alerts, otherwise start expanded
+    // (panel is always visible by default)
+</script>
 </body>
 </html>
