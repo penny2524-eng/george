@@ -76,8 +76,9 @@ except ImportError:
 # ── Region base URLs ──────────────────────────────────────────────────────────
 
 BASE_URLS: dict[str, str] = {
-    "eu": "https://eu1-developer.deyecloud.com/v1.0",
-    "us": "https://us1-developer.deyecloud.com/v1.0",
+    "eu":   "https://eu1-developer.deyecloud.com/v1.0",   # EU / APAC / Africa
+    "us":   "https://us1-developer.deyecloud.com/v1.0",   # Americas
+    "apac": "https://eu1-developer.deyecloud.com/v1.0",   # alias → same as EU
 }
 
 
@@ -384,8 +385,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--password",   default=os.getenv("DEYE_PASSWORD",   ""), metavar="PASS",
                    help="Deye Cloud account password (or DEYE_PASSWORD env var)")
     p.add_argument("--region",     default=os.getenv("DEYE_REGION", "eu"),
-                   choices=["eu", "us"],
-                   help="API region: eu (default) or us")
+                   choices=["eu", "apac", "us"],
+                   help="API region: eu/apac (default, covers EU+APAC+Africa) or us")
     p.add_argument("--base-url",   default=os.getenv("DEYE_BASE_URL", ""),
                    help="Override API base URL entirely")
 
