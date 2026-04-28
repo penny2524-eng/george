@@ -56,17 +56,19 @@ function mtErr(array $data): string { return $data['_error'] ?? 'Unknown error';
 
 // ── Fetch all data ───────────────────────────────────────────────────────────
 
-$resource  = mt('/system/resource');
-$identity  = mt('/system/identity');
-$board     = mt('/system/routerboard');
-$ifaces    = mt('/interface');
-$ipAddrs   = mt('/ip/address');
-$dhcpLease = mt('/ip/dhcp-server/lease');
-$arp       = mt('/ip/arp');
-$routes    = mt('/ip/route');
-$log       = mt('/log?limit=30');
-$wireless  = mt('/interface/wireless/registration-table');
-$health    = mt('/system/health');
+$resource   = mt('/system/resource');
+$identity   = mt('/system/identity');
+$board      = mt('/system/routerboard');
+$ifaces     = mt('/interface');
+$ipAddrs    = mt('/ip/address');
+$dhcpServer = mt('/ip/dhcp-server');
+$dhcpPool   = mt('/ip/pool');
+$dhcpLease  = mt('/ip/dhcp-server/lease');
+$arp        = mt('/ip/arp');
+$routes     = mt('/ip/route');
+$log        = mt('/log?limit=30');
+$wireless   = mt('/interface/wireless/registration-table');
+$health     = mt('/system/health');
 
 // ── Format helpers ───────────────────────────────────────────────────────────
 
@@ -382,15 +384,29 @@ $connectedAt   = date('Y-m-d H:i:s');
         <div class="stat-label">DHCP Leases</div>
         <?php
         $activeLeases = 0;
+        $totalPoolIPs = 0;
         if (mtOk($dhcpLease)) {
             foreach ($dhcpLease as $l) {
                 if (($l['status'] ?? '') === 'bound') $activeLeases++;
             }
         }
+        if (mtOk($dhcpPool)) {
+            foreach ($dhcpPool as $p) {
+                $parsed = parsePoolRanges($p['ranges'] ?? '');
+                $totalPoolIPs += $parsed['total'];
+            }
+        }
+        $poolPct = $totalPoolIPs > 0 ? (int) round($activeLeases / $totalPoolIPs * 100) : 0;
         ?>
-        <div class="stat-value"><?= $activeLeases ?></div>
-        <div class="stat-sub">
-            <?= mtOk($dhcpLease) ? count($dhcpLease) . ' total leases' : 'unavailable' ?>
+        <div class="stat-value" style="color:<?= $poolPct >= 90 ? '#f85149' : ($poolPct >= 75 ? '#d29922' : '#3fb950') ?>"><?= $activeLeases ?></div>
+        <div class="progress-wrap">
+            <div class="progress-label">
+                <span><?= $activeLeases ?> / <?= $totalPoolIPs ?> IPs</span>
+                <span><?= $poolPct ?>%</span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" style="width:<?= $poolPct ?>%;background:<?= $poolPct >= 90 ? '#f85149' : ($poolPct >= 75 ? '#d29922' : '#3fb950') ?>"></div>
+            </div>
         </div>
     </div>
 
@@ -503,6 +519,121 @@ $connectedAt   = date('Y-m-d H:i:s');
     </table>
     <?php endif; ?>
 </div>
+</div>
+
+<!-- ── DHCP Pool Capacity ─────────────────────────────────────────────────── -->
+<div class="card section-gap">
+    <div class="card-title"><span class="dot"></span> DHCP Pool Capacity</div>
+    <?php
+    /**
+     * Build a map: pool-name → [ranges, total IPs]
+     * Then cross-reference with servers and leases to compute used/free.
+     */
+    function parsePoolRanges(string $ranges): array
+    {
+        // ranges may be comma-separated: "192.168.50.10-192.168.50.100,192.168.50.150-192.168.50.200"
+        $total = 0;
+        $parts = [];
+        foreach (explode(',', $ranges) as $range) {
+            $range = trim($range);
+            if (str_contains($range, '-')) {
+                [$start, $end] = explode('-', $range, 2);
+                $count = ip2long(trim($end)) - ip2long(trim($start)) + 1;
+                if ($count > 0) {
+                    $total += $count;
+                    $parts[] = ['start' => trim($start), 'end' => trim($end), 'count' => $count];
+                }
+            } else {
+                $total++;
+                $parts[] = ['start' => $range, 'end' => $range, 'count' => 1];
+            }
+        }
+        return ['ranges' => $parts, 'total' => $total];
+    }
+
+    // Build pool info indexed by pool name
+    $poolInfo = [];
+    if (mtOk($dhcpPool)) {
+        foreach ($dhcpPool as $pool) {
+            $name   = $pool['name'] ?? '';
+            $ranges = $pool['ranges'] ?? '';
+            if ($name === '' || $ranges === '') continue;
+            $parsed = parsePoolRanges($ranges);
+            $poolInfo[$name] = [
+                'ranges'   => $parsed['ranges'],
+                'total'    => $parsed['total'],
+                'rawRange' => $ranges,
+            ];
+        }
+    }
+
+    // Map DHCP server → pool name
+    $serverPool = [];
+    if (mtOk($dhcpServer)) {
+        foreach ($dhcpServer as $srv) {
+            $serverPool[$srv['name'] ?? ''] = $srv['address-pool'] ?? '';
+        }
+    }
+
+    // Count bound leases per server
+    $leasesPerServer = [];
+    $leasesPerPool   = [];
+    if (mtOk($dhcpLease)) {
+        foreach ($dhcpLease as $lease) {
+            if (($lease['status'] ?? '') !== 'bound') continue;
+            $srv = $lease['server'] ?? '';
+            $leasesPerServer[$srv] = ($leasesPerServer[$srv] ?? 0) + 1;
+        }
+        // Translate server → pool
+        foreach ($leasesPerServer as $srv => $cnt) {
+            $pool = $serverPool[$srv] ?? $srv;
+            $leasesPerPool[$pool] = ($leasesPerPool[$pool] ?? 0) + $cnt;
+        }
+    }
+
+    if (empty($poolInfo)): ?>
+    <div class="error-box">No DHCP pools found<?= !mtOk($dhcpPool) ? ': ' . e(mtErr($dhcpPool)) : '' ?></div>
+    <?php else:
+        foreach ($poolInfo as $poolName => $info):
+            $total  = $info['total'];
+            $used   = $leasesPerPool[$poolName] ?? 0;
+            $free   = max(0, $total - $used);
+            $pct    = $total > 0 ? round($used / $total * 100) : 0;
+            $barColor = $pct >= 90 ? '#f85149' : ($pct >= 75 ? '#d29922' : '#3fb950');
+            $status   = $pct >= 90 ? 'CRITICAL' : ($pct >= 75 ? 'WARNING' : 'OK');
+            $statusCls = $pct >= 90 ? 'tag-red' : ($pct >= 75 ? '' : 'tag-green');
+            // Linked DHCP server name(s)
+            $linkedServers = array_keys(array_filter($serverPool, fn($p) => $p === $poolName));
+    ?>
+        <div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:1rem 1.1rem;margin-bottom:.75rem;">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem;margin-bottom:.6rem;">
+                <div>
+                    <span style="font-weight:700;font-size:.95rem;"><?= e($poolName) ?></span>
+                    <?php foreach ($linkedServers as $s): ?>
+                    <span class="tag tag-blue" style="margin-left:.4rem;">server: <?= e($s) ?></span>
+                    <?php endforeach; ?>
+                    <div style="font-size:.72rem;color:var(--muted);margin-top:.2rem;font-family:monospace;"><?= e($info['rawRange']) ?></div>
+                </div>
+                <div style="display:flex;align-items:center;gap:.75rem;">
+                    <span class="tag <?= $statusCls ?>" style="font-size:.8rem;padding:.2rem .7rem;"><?= $status ?></span>
+                    <span style="font-size:1.6rem;font-weight:700;color:<?= $barColor ?>"><?= $pct ?>%</span>
+                </div>
+            </div>
+            <!-- Progress bar -->
+            <div class="progress-bar" style="height:10px;margin-bottom:.5rem;">
+                <div class="progress-fill" style="width:<?= $pct ?>%;background:<?= $barColor ?>"></div>
+            </div>
+            <!-- Stats row -->
+            <div style="display:flex;gap:1.5rem;font-size:.8rem;">
+                <span>📦 Total: <strong><?= $total ?></strong></span>
+                <span style="color:<?= $barColor ?>">🔴 Used: <strong><?= $used ?></strong></span>
+                <span style="color:#3fb950">🟢 Free: <strong><?= $free ?></strong></span>
+                <?php if (!empty($info['ranges']) && count($info['ranges']) > 1): ?>
+                <span style="color:var(--muted)"><?= count($info['ranges']) ?> ranges</span>
+                <?php endif; ?>
+            </div>
+        </div>
+    <?php endforeach; endif; ?>
 </div>
 
 <!-- ── DHCP Leases ───────────────────────────────────────────────────────── -->
