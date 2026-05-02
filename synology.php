@@ -133,10 +133,17 @@ $cpuLoad = (int) ($utilization['cpu']['user_load'] ?? 0)
 if ($cpuLoad >= 90) syAlert('critical', 'CPU', "CPU usage critical: {$cpuLoad}%");
 elseif ($cpuLoad >= 75) syAlert('warning', 'CPU', "CPU usage high: {$cpuLoad}%");
 
-// Memory
-$memTotal = (int) ($utilization['memory']['total_real'] ?? 0);
-$memUsed  = $memTotal - (int) ($utilization['memory']['avail_real'] ?? 0);
-$memPct   = $memTotal > 0 ? (int) round($memUsed / $memTotal * 100) : 0;
+// Memory — DSM returns all values in KB
+// Use real_usage (pre-computed by DSM, excludes buffer/cache) for the percentage.
+// For the "used" display bytes, subtract free + buffer + cached so it matches DSM UI.
+$memTotal  = (int) ($utilization['memory']['total_real'] ?? 0);
+$memFree   = (int) ($utilization['memory']['avail_real'] ?? 0);
+$memBuffer = (int) ($utilization['memory']['buffer']     ?? 0);
+$memCached = (int) ($utilization['memory']['cached']     ?? 0);
+$memUsed   = max(0, $memTotal - $memFree - $memBuffer - $memCached);  // app-used only
+$memPct    = $memTotal > 0
+    ? (int) ($utilization['memory']['real_usage'] ?? round($memUsed / $memTotal * 100))
+    : 0;
 if ($memPct >= 90) syAlert('critical', 'Memory', "Memory usage critical: {$memPct}%");
 elseif ($memPct >= 80) syAlert('warning', 'Memory', "Memory usage high: {$memPct}%");
 
