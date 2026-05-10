@@ -1,0 +1,18 @@
+# credentials — never commit with real values
+skyhigh_zscaler_migration/credentials.py
+
+# dotenv
+.env
+skyhigh_zscaler_migration/.env
+
+# output files
+*.json
+*.bin
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/

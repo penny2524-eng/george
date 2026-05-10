@@ -27,17 +27,14 @@ Usage
 import argparse
 import json
 import logging
-import os
 import sys
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 from skyhigh_client import (
     SkyhighCloudClient, SkyhighCloudConfig,
     SkyhighOnPremClient, SkyhighOnPremConfig,
 )
-from zscaler_client import ZscalerZIAClient, ZscalerZIAConfig
+from zscaler_client import ZscalerZIAClient, ZscalerZIAConfig, ZscalerZPAClient, ZscalerZPAConfig
 from migration_mapper import full_migration_report
 from policy_tables import (
     console,
@@ -47,8 +44,7 @@ from policy_tables import (
     show_migration_report,
     show_side_by_side_comparison,
 )
-
-load_dotenv()
+import credentials as creds
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,49 +55,68 @@ logger = logging.getLogger("migrate")
 
 
 # ---------------------------------------------------------------------------
-# Config builders from environment variables
+# Config builders — read from credentials.py
 # ---------------------------------------------------------------------------
 
 def _skyhigh_cloud_config() -> SkyhighCloudConfig:
-    required = ["SHN_TENANT_ID", "SHN_USERNAME", "SHN_PASSWORD"]
-    _check_env(required)
+    missing = creds.validate("skyhigh_cloud")
+    if missing:
+        console.print(f"[bold red]credentials.py — SKYHIGH_CLOUD fields not set: {missing}[/]")
+        console.print("Edit [bold]credentials.py[/] Section 1 and fill in the missing values.")
+        sys.exit(1)
+    c = creds.SKYHIGH_CLOUD
     return SkyhighCloudConfig(
-        tenant_id=os.environ["SHN_TENANT_ID"],
-        username=os.environ["SHN_USERNAME"],
-        password=os.environ["SHN_PASSWORD"],
-        region=os.environ.get("SHN_REGION", "us"),
+        tenant_id=c["tenant_id"],
+        username=c["username"],
+        password=c["password"],
+        region=c["region"],
     )
 
 
 def _skyhigh_onprem_config() -> SkyhighOnPremConfig:
-    required = ["SHN_ONPREM_HOST", "SHN_ONPREM_USERNAME", "SHN_ONPREM_PASSWORD"]
-    _check_env(required)
+    missing = creds.validate("skyhigh_onprem")
+    if missing:
+        console.print(f"[bold red]credentials.py — SKYHIGH_ONPREM fields not set: {missing}[/]")
+        console.print("Edit [bold]credentials.py[/] Section 2 and fill in the missing values.")
+        sys.exit(1)
+    c = creds.SKYHIGH_ONPREM
     return SkyhighOnPremConfig(
-        host=os.environ["SHN_ONPREM_HOST"],
-        username=os.environ["SHN_ONPREM_USERNAME"],
-        password=os.environ["SHN_ONPREM_PASSWORD"],
-        port=int(os.environ.get("SHN_ONPREM_PORT", 4711)),
-        use_ssl=os.environ.get("SHN_ONPREM_SSL", "false").lower() == "true",
+        host=c["host"],
+        port=c["port"],
+        username=c["username"],
+        password=c["password"],
+        use_ssl=c["use_ssl"],
     )
 
 
 def _zia_config() -> ZscalerZIAConfig:
-    required = ["ZIA_CLOUD", "ZIA_USERNAME", "ZIA_PASSWORD", "ZIA_API_KEY"]
-    _check_env(required)
+    missing = creds.validate("zia")
+    if missing:
+        console.print(f"[bold red]credentials.py — ZSCALER_ZIA fields not set: {missing}[/]")
+        console.print("Edit [bold]credentials.py[/] Section 3 and fill in the missing values.")
+        sys.exit(1)
+    c = creds.ZSCALER_ZIA
     return ZscalerZIAConfig(
-        cloud=os.environ["ZIA_CLOUD"],
-        username=os.environ["ZIA_USERNAME"],
-        password=os.environ["ZIA_PASSWORD"],
-        api_key=os.environ["ZIA_API_KEY"],
+        cloud=c["cloud"],
+        username=c["username"],
+        password=c["password"],
+        api_key=c["api_key"],
     )
 
 
-def _check_env(keys: list) -> None:
-    missing = [k for k in keys if not os.environ.get(k)]
+def _zpa_config() -> ZscalerZPAConfig:
+    missing = creds.validate("zpa")
     if missing:
-        console.print(f"[bold red]Missing required environment variables: {missing}[/]")
-        console.print("Copy [bold].env.example[/] to [bold].env[/] and fill in the values.")
+        console.print(f"[bold red]credentials.py — ZSCALER_ZPA fields not set: {missing}[/]")
+        console.print("Edit [bold]credentials.py[/] Section 4 and fill in the missing values.")
         sys.exit(1)
+    c = creds.ZSCALER_ZPA
+    return ZscalerZPAConfig(
+        client_id=c["client_id"],
+        client_secret=c["client_secret"],
+        customer_id=c["customer_id"],
+        cloud=c["cloud"],
+    )
 
 
 # ---------------------------------------------------------------------------
