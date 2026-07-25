@@ -1,613 +1,1026 @@
 <?php
 declare(strict_types=1);
 
-// ── Deye Inverter API (Solarman Cloud) ───────────────────────────────────────
-//
-// Deye inverters use the Solarman cloud platform.
-// Global API base: https://globalapi.solarmanpv.com
-// China API base:  https://api.solarmanpv.com
-//
-// Required credentials (stored in config or .env):
-//   APP_ID      – your Solarman developer app ID
-//   APP_SECRET  – your Solarman app secret
-//   USER_EMAIL  – Solarman account email
-//   USER_PASS   – Solarman account password  (plain text sent over HTTPS)
-//   DEVICE_SN   – inverter / data-logger serial number (optional: auto-detected)
+// ── Credentials (from portal.php) ────────────────────────────────────────────
+const DEYE_BASE    = 'https://eu1-developer.deyecloud.com/v1.0';
+const DEYE_APPID   = '202604284470012';
+const DEYE_SECRET  = 'bd6abff1bb8c315065df6fd5a63286d1';
+const DEYE_EMAIL   = 'penny2524@gmail.com';
+const DEYE_PASS    = 'Penny2000!';
+const DEYE_STATION = 61523693;
+const DEYE_SN_HINT = '2507133177';
 
-// ── Config ────────────────────────────────────────────────────────────────────
-
-$CONFIG = [
-    'base_url'   => 'https://globalapi.solarmanpv.com',
-    'app_id'     => $_ENV['DEYE_APP_ID']     ?? '',
-    'app_secret' => $_ENV['DEYE_APP_SECRET'] ?? '',
-    'email'      => $_ENV['DEYE_EMAIL']      ?? '',
-    'password'   => $_ENV['DEYE_PASSWORD']   ?? '',
-    'device_sn'  => $_ENV['DEYE_DEVICE_SN']  ?? '',
-];
-
-// Override from posted form (demo / quick-test usage)
-$formConfig = [];
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['app_id'])) {
-    $formConfig = [
-        'app_id'     => trim($_POST['app_id']     ?? ''),
-        'app_secret' => trim($_POST['app_secret'] ?? ''),
-        'email'      => trim($_POST['email']      ?? ''),
-        'password'   => trim($_POST['password']   ?? ''),
-        'device_sn'  => trim($_POST['device_sn']  ?? ''),
-    ];
-    foreach ($formConfig as $k => $v) {
-        if ($v !== '') $CONFIG[$k] = $v;
-    }
-}
-
-// ── Solarman API Client ───────────────────────────────────────────────────────
-
-class SolarmanClient
+// ── API helper ────────────────────────────────────────────────────────────────
+function apiPost(string $path, array $body, string $token = ''): array
 {
-    private string $baseUrl;
-    private string $appId;
-    private string $appSecret;
-    private string $accessToken = '';
-
-    public function __construct(string $baseUrl, string $appId, string $appSecret)
-    {
-        $this->baseUrl   = rtrim($baseUrl, '/');
-        $this->appId     = $appId;
-        $this->appSecret = $appSecret;
+    $headers = ['Content-Type: application/json'];
+    if ($token !== '') {
+        $headers[] = 'Authorization: bearer ' . $token;
     }
+    $ch = curl_init(DEYE_BASE . $path);
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => json_encode($body),
+        CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 15,
+        CURLOPT_SSL_VERIFYPEER => false,
+    ]);
+    $raw  = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
 
-    // ── Authentication ────────────────────────────────────────────────────────
-
-    /**
-     * Obtain an access token.
-     * Sign = MD5(appId + timestamp + appSecret)
-     */
-    public function login(string $email, string $password): array
-    {
-        $timestamp = time();
-        $sign      = md5($this->appId . $timestamp . $this->appSecret);
-
-        $payload = [
-            'appSecret' => $this->appSecret,
-            'email'     => $email,
-            'password'  => md5($password),       // Solarman expects MD5'd password
-        ];
-
-        $result = $this->post(
-            '/account/v1.0/token?appId=' . urlencode($this->appId)
-                . '&language=en&timestamp=' . $timestamp
-                . '&sign=' . $sign,
-            $payload,
-            authenticated: false
-        );
-
-        if (isset($result['access_token'])) {
-            $this->accessToken = $result['access_token'];
-        }
-
-        return $result;
+    if ($err !== '') {
+        return ['_error' => $err, '_code' => $code];
     }
-
-    // ── Stations ──────────────────────────────────────────────────────────────
-
-    /** List all plants / stations linked to the account. */
-    public function listStations(int $page = 1, int $size = 20): array
-    {
-        return $this->post('/station/v1.0/list', [
-            'page' => $page,
-            'size' => $size,
-        ]);
-    }
-
-    /** Get detailed info for a single station. */
-    public function getStation(int $stationId): array
-    {
-        return $this->post('/station/v1.0/detail', ['stationId' => $stationId]);
-    }
-
-    // ── Devices ───────────────────────────────────────────────────────────────
-
-    /** List devices (loggers/inverters) attached to a station. */
-    public function listDevices(int $stationId, int $page = 1, int $size = 20): array
-    {
-        return $this->post('/station/v1.0/device', [
-            'stationId' => $stationId,
-            'page'      => $page,
-            'size'      => $size,
-        ]);
-    }
-
-    // ── Real-time data ────────────────────────────────────────────────────────
-
-    /** Fetch latest real-time data points from an inverter by device SN. */
-    public function getRealtimeData(string $deviceSn): array
-    {
-        return $this->post('/device/v1.0/currentData', ['deviceSn' => $deviceSn]);
-    }
-
-    /** Fetch historical data for a given day. */
-    public function getHistoricalData(string $deviceSn, string $date): array
-    {
-        return $this->post('/device/v1.0/historical/day', [
-            'deviceSn' => $deviceSn,
-            'date'     => $date,          // YYYY-MM-DD
-        ]);
-    }
-
-    // ── HTTP helpers ──────────────────────────────────────────────────────────
-
-    private function post(string $path, array $body, bool $authenticated = true): array
-    {
-        $url     = $this->baseUrl . $path;
-        $headers = ['Content-Type: application/json'];
-        if ($authenticated && $this->accessToken !== '') {
-            $headers[] = 'Authorization: Bearer ' . $this->accessToken;
-        }
-
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => json_encode($body, JSON_THROW_ON_ERROR),
-            CURLOPT_HTTPHEADER     => $headers,
-            CURLOPT_TIMEOUT        => 15,
-            CURLOPT_SSL_VERIFYPEER => true,
-        ]);
-
-        $raw  = curl_exec($ch);
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $err  = curl_error($ch);
-        curl_close($ch);
-
-        if ($raw === false || $err !== '') {
-            return ['success' => false, 'msg' => 'cURL error: ' . $err];
-        }
-
-        $data = json_decode($raw, associative: true);
-        if (!is_array($data)) {
-            return ['success' => false, 'msg' => 'Invalid JSON response (HTTP ' . $code . ')'];
-        }
-
-        return $data;
-    }
-
-    public function getAccessToken(): string { return $this->accessToken; }
+    $decoded = json_decode($raw ?: '', true);
+    return is_array($decoded) ? $decoded : ['_error' => 'bad json', '_code' => $code, '_raw' => substr((string)$raw, 0, 300)];
 }
 
-// ── Unit helpers ──────────────────────────────────────────────────────────────
+// ── Authenticate ──────────────────────────────────────────────────────────────
+$authResp = apiPost('/account/token?appId=' . DEYE_APPID, [
+    'appSecret' => DEYE_SECRET,
+    'email'     => DEYE_EMAIL,
+    'password'  => hash('sha256', DEYE_PASS),
+    'companyId' => '0',
+]);
+$token     = $authResp['accessToken'] ?? ($authResp['data']['accessToken'] ?? '');
+$authError = $token === ''
+    ? ($authResp['msg'] ?? $authResp['message'] ?? ($authResp['_error'] ?? json_encode($authResp)))
+    : null;
 
-/**
- * Map raw Solarman data-point names to human-readable labels and units.
- * Keys match the `key` field returned in the dataList array.
- */
-const METRIC_META = [
-    'DV1'  => ['label' => 'PV1 Voltage',        'unit' => 'V',   'icon' => '⚡'],
-    'DC1'  => ['label' => 'PV1 Current',         'unit' => 'A',   'icon' => '🔋'],
-    'DP1'  => ['label' => 'PV1 Power',           'unit' => 'W',   'icon' => '☀️'],
-    'DV2'  => ['label' => 'PV2 Voltage',         'unit' => 'V',   'icon' => '⚡'],
-    'DC2'  => ['label' => 'PV2 Current',         'unit' => 'A',   'icon' => '🔋'],
-    'DP2'  => ['label' => 'PV2 Power',           'unit' => 'W',   'icon' => '☀️'],
-    'SV1'  => ['label' => 'Grid L1 Voltage',     'unit' => 'V',   'icon' => '🏠'],
-    'SC1'  => ['label' => 'Grid L1 Current',     'unit' => 'A',   'icon' => '🏠'],
-    'SV2'  => ['label' => 'Grid L2 Voltage',     'unit' => 'V',   'icon' => '🏠'],
-    'SC2'  => ['label' => 'Grid L2 Current',     'unit' => 'A',   'icon' => '🏠'],
-    'SV3'  => ['label' => 'Grid L3 Voltage',     'unit' => 'V',   'icon' => '🏠'],
-    'SC3'  => ['label' => 'Grid L3 Current',     'unit' => 'A',   'icon' => '🏠'],
-    'APo'  => ['label' => 'Active Power',        'unit' => 'W',   'icon' => '⚡'],
-    'RPo'  => ['label' => 'Reactive Power',      'unit' => 'Var', 'icon' => '⚡'],
-    'APPo' => ['label' => 'Apparent Power',      'unit' => 'VA',  'icon' => '⚡'],
-    'PF'   => ['label' => 'Power Factor',        'unit' => '',    'icon' => '📊'],
-    'Fac'  => ['label' => 'Grid Frequency',      'unit' => 'Hz',  'icon' => '📡'],
-    'Etdy' => ['label' => 'Energy Today',        'unit' => 'kWh', 'icon' => '📈'],
-    'Etot' => ['label' => 'Total Energy',        'unit' => 'kWh', 'icon' => '📊'],
-    'Tmp'  => ['label' => 'Inverter Temp.',      'unit' => '°C',  'icon' => '🌡️'],
-    'BV'   => ['label' => 'Battery Voltage',     'unit' => 'V',   'icon' => '🔋'],
-    'BC'   => ['label' => 'Battery Current',     'unit' => 'A',   'icon' => '🔋'],
-    'BP'   => ['label' => 'Battery Power',       'unit' => 'W',   'icon' => '🔋'],
-    'BSOC' => ['label' => 'Battery State (SoC)', 'unit' => '%',   'icon' => '🔋'],
-    'BST'  => ['label' => 'Battery Status',      'unit' => '',    'icon' => '🔋'],
-    'LV'   => ['label' => 'Load Voltage',        'unit' => 'V',   'icon' => '🏭'],
-    'LC'   => ['label' => 'Load Current',        'unit' => 'A',   'icon' => '🏭'],
-    'LP'   => ['label' => 'Load Power',          'unit' => 'W',   'icon' => '🏭'],
-];
+// ── Fetch data ────────────────────────────────────────────────────────────────
+$stData    = [];   // station/latest response
+$deviceSn  = '';
+$allPoints = [];   // full dataList
+$kv        = [];   // key => float value
+$kvFull    = [];   // key => full point [{key,name,value,unit}]
+$collectTime = '';
+$apiError  = null;
 
-function metaFor(string $key): array
-{
-    return METRIC_META[$key] ?? ['label' => $key, 'unit' => '', 'icon' => '📌'];
-}
-
-// ── Run the API calls ─────────────────────────────────────────────────────────
-
-$result   = null;
-$error    = null;
-$stations = [];
-$devices  = [];
-$realtimeData = [];
-
-$credentialsProvided =
-    $CONFIG['app_id'] !== '' &&
-    $CONFIG['app_secret'] !== '' &&
-    $CONFIG['email'] !== '' &&
-    $CONFIG['password'] !== '';
-
-if ($credentialsProvided) {
-    $client = new SolarmanClient($CONFIG['base_url'], $CONFIG['app_id'], $CONFIG['app_secret']);
-
-    $loginResult = $client->login($CONFIG['email'], $CONFIG['password']);
-
-    if (empty($loginResult['access_token'])) {
-        $error = 'Login failed: ' . ($loginResult['msg'] ?? json_encode($loginResult));
+if ($token !== '') {
+    // Station summary
+    $stResp = apiPost('/station/latest', ['stationId' => DEYE_STATION], $token);
+    if (!empty($stResp['success'])) {
+        $stData = $stResp;
     } else {
-        // Fetch stations
-        $stationsResult = $client->listStations();
-        $stations = $stationsResult['stationList'] ?? [];
+        $apiError = 'Station data: ' . ($stResp['msg'] ?? $stResp['_error'] ?? json_encode($stResp));
+    }
 
-        // If we have a device SN, fetch real-time data directly
-        if ($CONFIG['device_sn'] !== '') {
-            $rtResult = $client->getRealtimeData($CONFIG['device_sn']);
-            if (isset($rtResult['dataList'])) {
-                $realtimeData = $rtResult['dataList'];
-                $result = $rtResult;
-            } else {
-                $error = 'Could not fetch device data: ' . ($rtResult['msg'] ?? json_encode($rtResult));
-            }
-        } elseif (!empty($stations)) {
-            // Auto-detect: grab first station's devices
-            $firstStationId = (int) ($stations[0]['id'] ?? 0);
-            if ($firstStationId > 0) {
-                $devResult = $client->listDevices($firstStationId);
-                $devices = $devResult['deviceListItems'] ?? [];
-            }
+    // Device list → get inverter SN
+    $devResp = apiPost('/station/device', ['stationIds' => [DEYE_STATION]], $token);
+    $devList = $devResp['deviceListItems'] ?? ($devResp['deviceList'] ?? []);
+    foreach ($devList as $d) {
+        if (($d['deviceType'] ?? '') === 'INVERTER') {
+            $deviceSn = $d['deviceSn'] ?? '';
+            break;
         }
+    }
+    if ($deviceSn === '') {
+        $deviceSn = DEYE_SN_HINT;
+    }
+
+    // Device real-time data
+    $ltResp  = apiPost('/device/latest', ['deviceList' => [$deviceSn]], $token);
+    $devItem = $ltResp['deviceDataList'][0]
+            ?? $ltResp['deviceList'][0]
+            ?? [];
+    $allPoints   = $devItem['dataList'] ?? [];
+    $collectTime = $devItem['collectTime'] ?? ($ltResp['collectTime'] ?? '');
+
+    foreach ($allPoints as $p) {
+        $key = $p['key'] ?? '';
+        if ($key === '') continue;
+        $kv[$key]     = isset($p['value']) ? (float) $p['value'] : null;
+        $kvFull[$key] = $p;
+    }
+}
+
+// ── Battery key resolver ──────────────────────────────────────────────────────
+// Try multiple known naming conventions, return first match found
+function bval(array $kv, array $keys): mixed
+{
+    foreach ($keys as $k) {
+        if (array_key_exists($k, $kv) && $kv[$k] !== null) {
+            return $kv[$k];
+        }
+    }
+    return null;
+}
+
+function bfull(array $kvFull, array $keys): ?array
+{
+    foreach ($keys as $k) {
+        if (isset($kvFull[$k])) {
+            return $kvFull[$k];
+        }
+    }
+    return null;
+}
+
+// Battery 1 — try every known key pattern for this metric
+$bat1 = [
+    'soc'    => bval($kv, ['Battery1SOC','Bat1SOC','BMS_BatterySOC1','BMS_BattSOC1','BattSOC1',
+                            'BatterySOC','BatSOC','BMS_BatterySOC','SoC_of_battery_1']),
+    'soh'    => bval($kv, ['Battery1SOH','Bat1SOH','BMS_BatteryHealth1','BMS_BattHealth1',
+                            'BatteryHealth','BatterySOH','BatSOH','BMS_BatteryCapacity1']),
+    'volt'   => bval($kv, ['Battery1Volt','Battery1Voltage','Bat1Volt','BMS_BatteryVoltage1',
+                            'BMS_BattVolt1','BatteryVoltage','BatVolt','BattVolt']),
+    'curr'   => bval($kv, ['Battery1Current','Battery1Curr','Bat1Current','BMS_BatteryCurrent1',
+                            'BMS_BattCurr1','BatteryCurrent','BatCurrent','BattCurr']),
+    'power'  => bval($kv, ['Battery1Power','Bat1Power','Battery1Pwr','BMS_BattPower1',
+                            'BatteryPower','BatPower','BattPower']),
+    'temp'   => bval($kv, ['Battery1Temp','Battery1Temperature','Bat1Temp','BMS_BatteryTemp1',
+                            'BMS_BattTemp1','Temperature- Battery','BatteryTemp','BatTemp','BattTemp']),
+    'cycles' => bval($kv, ['Battery1Cycles','Bat1Cycles','BMS_BatteryChargeCycles1',
+                            'BMS_BattCycles1','BatteryCycles','BatCycles','BattCycles','ChargeCycles1']),
+    'status' => bval($kv, ['Battery1Status','Bat1Status','BMS_ChargeState1','BMS_BattStatus1',
+                            'BatteryStatus','BatStatus','BattStatus','BMS_BatteryStatus1']),
+    'cap'    => bval($kv, ['Battery1CapRemain','Bat1CapRemain','BMS_BatteryCapacityRemain1',
+                            'BatteryCapacityRemain','BatCapRemain']),
+    'maxv'   => bval($kv, ['Battery1MaxVolt','BMS_BattCellMaxVolt1','BattCellMaxVolt','CellMaxVolt']),
+    'minv'   => bval($kv, ['Battery1MinVolt','BMS_BattCellMinVolt1','BattCellMinVolt','CellMinVolt']),
+    'alarm'  => bval($kv, ['Battery1Alarm','BMS_BattAlarm1','BatteryAlarm','BatAlarm']),
+];
+
+// Battery 2
+$bat2 = [
+    'soc'    => bval($kv, ['Battery2SOC','Bat2SOC','BMS_BatterySOC2','BMS_BattSOC2','BattSOC2',
+                            'SoC_of_battery_2']),
+    'soh'    => bval($kv, ['Battery2SOH','Bat2SOH','BMS_BatteryHealth2','BMS_BattHealth2',
+                            'BMS_BatteryCapacity2']),
+    'volt'   => bval($kv, ['Battery2Volt','Battery2Voltage','Bat2Volt','BMS_BatteryVoltage2',
+                            'BMS_BattVolt2']),
+    'curr'   => bval($kv, ['Battery2Current','Battery2Curr','Bat2Current','BMS_BatteryCurrent2',
+                            'BMS_BattCurr2']),
+    'power'  => bval($kv, ['Battery2Power','Bat2Power','Battery2Pwr','BMS_BattPower2']),
+    'temp'   => bval($kv, ['Battery2Temp','Battery2Temperature','Bat2Temp','BMS_BatteryTemp2',
+                            'BMS_BattTemp2']),
+    'cycles' => bval($kv, ['Battery2Cycles','Bat2Cycles','BMS_BatteryChargeCycles2',
+                            'BMS_BattCycles2','ChargeCycles2']),
+    'status' => bval($kv, ['Battery2Status','Bat2Status','BMS_ChargeState2','BMS_BattStatus2',
+                            'BMS_BatteryStatus2']),
+    'cap'    => bval($kv, ['Battery2CapRemain','Bat2CapRemain','BMS_BatteryCapacityRemain2']),
+    'maxv'   => bval($kv, ['Battery2MaxVolt','BMS_BattCellMaxVolt2','BattCellMaxVolt2']),
+    'minv'   => bval($kv, ['Battery2MinVolt','BMS_BattCellMinVolt2','BattCellMinVolt2']),
+    'alarm'  => bval($kv, ['Battery2Alarm','BMS_BattAlarm2']),
+];
+
+// If bat2 has no dedicated data, it might be reported as battery 1 / combined
+$hasBat2 = array_filter($bat2, fn($v) => $v !== null) !== [];
+
+// Station-level (from /station/latest)
+$stBatSoc   = $stData['batterySOC']   ?? null;
+$stBatPower = $stData['batteryPower'] ?? null;  // negative = charging
+$stGenPower = $stData['generationPower']   ?? null;
+$stLoadPower= $stData['consumptionPower']  ?? null;
+$stGridPower= $stData['wirePower']         ?? null;
+$stDayKwh   = $stData['generationValue']   ?? null;
+$stTotKwh   = $stData['totalGenerationValue'] ?? null;
+$stLastUp   = $stData['lastUpdateTime']    ?? null;
+
+// SOC: fall back to station level if device-level not found
+if ($bat1['soc'] === null && $stBatSoc !== null) {
+    $bat1['soc'] = $stBatSoc;
+}
+if ($bat1['power'] === null && $stBatPower !== null) {
+    $bat1['power'] = $stBatPower;
+}
+
+// ── Categorise all data points ────────────────────────────────────────────────
+// Group every point from dataList into named sections for display
+$sections = [
+    'bat_combined' => [],
+    'bat1'         => [],
+    'bat2'         => [],
+    'pv'           => [],
+    'grid'         => [],
+    'load'         => [],
+    'inverter'     => [],
+    'other'        => [],
+];
+
+foreach ($allPoints as $p) {
+    $key  = strtolower($p['key']  ?? '');
+    $name = strtolower($p['name'] ?? '');
+    $combined = $key . ' ' . $name;
+
+    // Detect battery number
+    $isBat1  = preg_match('/bat1|battery1|batt1|bms.*1|_1$|no\.?1|num\.?1/i', $combined);
+    $isBat2  = preg_match('/bat2|battery2|batt2|bms.*2|_2$|no\.?2|num\.?2/i', $combined);
+    $isBat   = preg_match('/bat|batt|battery|bms|soc|cell|lithium|pack/i', $combined);
+    $isPv    = preg_match('/pv|solar|dc.volt|dc.curr|dc.power|string/i', $combined);
+    $isGrid  = preg_match('/grid|wire|meter|import|export|ac.volt|ac.curr|frequency|hz/i', $combined);
+    $isLoad  = preg_match('/load|consump|home|house/i', $combined);
+    $isInv   = preg_match('/temp|inverter|status|fault|warn|alarm|power.?factor|apparent|reactive/i', $combined);
+
+    if ($isBat1) {
+        $sections['bat1'][] = $p;
+    } elseif ($isBat2) {
+        $sections['bat2'][] = $p;
+    } elseif ($isBat) {
+        $sections['bat_combined'][] = $p;
+    } elseif ($isPv) {
+        $sections['pv'][] = $p;
+    } elseif ($isGrid) {
+        $sections['grid'][] = $p;
+    } elseif ($isLoad) {
+        $sections['load'][] = $p;
+    } elseif ($isInv) {
+        $sections['inverter'][] = $p;
+    } else {
+        $sections['other'][] = $p;
     }
 }
 
 // ── Helper ────────────────────────────────────────────────────────────────────
-
 function e(string $s): string
 {
     return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
-function renderMetricCard(array $point): string
+function fmtVal(mixed $v, string $unit = '', int $dp = 1): string
 {
-    $key   = $point['key']   ?? '';
-    $value = $point['value'] ?? '—';
-    $meta  = metaFor($key);
-    $unit  = !empty($point['unit']) ? $point['unit'] : $meta['unit'];
-    $label = $meta['label'];
-    $icon  = $meta['icon'];
+    if ($v === null) return '—';
+    $n = round((float) $v, $dp);
+    return $n . ($unit !== '' ? ' ' . $unit : '');
+}
 
-    $displayVal = ($value !== '' && $value !== null) ? $value : '—';
-    $displayUnit = ($unit !== '' && $displayVal !== '—') ? '<span class="unit">' . e($unit) . '</span>' : '';
+function batStatus(mixed $v): string
+{
+    if ($v === null) return '—';
+    $s = (int) $v;
+    return match($s) {
+        0  => 'Standby',
+        1  => 'Charging',
+        2  => 'Discharging',
+        3  => 'Fault',
+        4  => 'Hibernating',
+        11 => 'Idle',
+        default => 'State ' . $s,
+    };
+}
 
-    return <<<HTML
-    <div class="metric-card">
-        <div class="metric-icon">{$icon}</div>
-        <div class="metric-value">{$displayVal}{$displayUnit}</div>
-        <div class="metric-label">{$label}</div>
-    </div>
-    HTML;
+function powerLabel(mixed $w): array  // [label, arrow, css-class]
+{
+    if ($w === null) return ['—', '', 'muted'];
+    $f = (float) $w;
+    if ($f < -20) return ['Charging',     '↑', 'charging'];
+    if ($f >  20) return ['Discharging',  '↓', 'discharging'];
+    return ['Idle', '◉', 'idle'];
+}
+
+function socColor(mixed $soc): string
+{
+    if ($soc === null) return '#4a6878';
+    $s = (float) $soc;
+    if ($s >= 50) return '#00ffcc';
+    if ($s >= 20) return '#ffcc00';
+    return '#ff4070';
 }
 
 ?>
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Deye Inverter Dashboard</title>
-    <style>
-        :root {
-            --blue:    #3b82f6;
-            --blue-dk: #1e40af;
-            --green:   #10b981;
-            --red:     #ef4444;
-            --amber:   #f59e0b;
-            --gray:    #6b7280;
-            --bg:      #0f172a;
-            --surface: #1e293b;
-            --surface2:#263045;
-            --border:  #334155;
-            --text:    #e2e8f0;
-            --muted:   #94a3b8;
-            --radius:  12px;
-        }
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deye Battery Dashboard</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:      #182d4e;
+  --surface: rgba(35, 82, 150, 0.70);
+  --card:    rgba(12, 28, 55, 0.85);
+  --border:  rgba(0, 212, 255, 0.30);
+  --border-h:rgba(0, 212, 255, 0.75);
+  --text:    #f0f8ff;
+  --muted:   #92b8d8;
+  --green:   #00ffcc;
+  --red:     #ff4070;
+  --yellow:  #ffcc00;
+  --blue:    #38c8ff;
+  --cyan:    #00f5ff;
+  --purple:  #c084fc;
+  --amber:   #fbbf24;
+  --radius:  12px;
+}
 
-        body {
-            font-family: 'Segoe UI', system-ui, sans-serif;
-            background: var(--bg);
-            color: var(--text);
-            min-height: 100vh;
-        }
+body {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(rgba(0, 212, 255, 0.09) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 212, 255, 0.09) 1px, transparent 1px);
+  background-size: 44px 44px;
+  color: var(--text);
+  min-height: 100vh;
+}
 
-        header {
-            background: linear-gradient(135deg, #0f2027, #1a3a4a, var(--blue-dk));
-            padding: 1.25rem 2rem;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 1rem;
-            box-shadow: 0 2px 12px rgba(0,0,0,.4);
-            flex-wrap: wrap;
-        }
-        header h1 { font-size: 1.5rem; font-weight: 700; display: flex; align-items: center; gap: .6rem; }
-        .header-sub { font-size: .8rem; color: var(--muted); }
+/* Orbs */
+.orb { position:fixed; border-radius:50%; filter:blur(70px); pointer-events:none; z-index:-1; }
+.orb-1 { width:620px;height:620px;top:-120px;left:-100px;background:radial-gradient(circle,rgba(30,100,255,.38) 0%,transparent 68%);animation:od1 16s ease-in-out infinite alternate; }
+.orb-2 { width:500px;height:500px;bottom:-100px;right:-80px;background:radial-gradient(circle,rgba(160,0,255,.32) 0%,transparent 68%);animation:od2 20s ease-in-out infinite alternate; }
+.orb-3 { width:420px;height:420px;top:30%;right:-60px;background:radial-gradient(circle,rgba(0,220,200,.24) 0%,transparent 68%);animation:od3 13s ease-in-out infinite alternate; }
+@keyframes od1 { from{transform:translate(0,0) scale(1)} to{transform:translate(80px,100px) scale(1.16)} }
+@keyframes od2 { from{transform:translate(0,0) scale(1)} to{transform:translate(-80px,-80px) scale(1.2)} }
+@keyframes od3 { from{transform:translate(0,0) scale(1)} to{transform:translate(-60px,80px) scale(1.1)} }
 
-        .container { max-width: 1200px; margin: 0 auto; padding: 2rem 1.5rem; }
+/* Header */
+header {
+  background: linear-gradient(135deg, #0a1628 0%, #0f2240 50%, #162e52 100%);
+  border-bottom: 1px solid var(--border);
+  padding: .8rem 2rem;
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .75rem;
+  position: sticky; top: 0; z-index: 10;
+  backdrop-filter: blur(12px);
+}
+header h1 { font-size: 1.3rem; font-weight: 800; display:flex; align-items:center; gap:.6rem; }
+.grad {
+  background: linear-gradient(120deg, var(--amber) 0%, #ff9500 35%, var(--cyan) 70%, var(--purple) 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text;
+  filter: drop-shadow(0 0 18px rgba(255,190,0,.6));
+}
+.header-right { display:flex; align-items:center; gap:.75rem; flex-wrap:wrap; }
+.refresh-btn {
+  background: rgba(0,212,255,.07); border:1px solid rgba(0,212,255,.3);
+  color:var(--cyan); border-radius:7px; padding:.3rem .75rem; font-size:.78rem;
+  cursor:pointer; transition:all .2s; font-family:'Courier New',monospace;
+}
+.refresh-btn:hover { background:rgba(0,212,255,.14); border-color:var(--cyan); box-shadow:0 0 18px rgba(0,212,255,.3); }
+.update-time { font-size:.7rem; color:var(--muted); font-family:'Courier New',monospace; }
 
-        /* Flash */
-        .flash { padding: .85rem 1.1rem; border-radius: 8px; margin-bottom: 1.5rem; font-weight: 500; }
-        .flash.error   { background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }
-        .flash.success { background: #052e16; color: #6ee7b7; border: 1px solid #065f46; }
+/* Badges */
+.badge {
+  display:inline-flex; align-items:center; gap:.3rem; border-radius:20px;
+  padding:.18rem .6rem; font-size:.67rem; font-weight:700;
+  text-transform:uppercase; letter-spacing:.07em; font-family:'Courier New',monospace;
+}
+.badge::before { content:''; width:5px; height:5px; border-radius:50%; background:currentColor; flex-shrink:0; }
+.badge-ok      { background:rgba(0,255,204,.12); color:var(--green); border:1px solid rgba(0,255,204,.45); }
+.badge-ok::before { animation:dotpulse 2s ease-in-out infinite; }
+.badge-err     { background:rgba(255,64,112,.1); color:var(--red); border:1px solid rgba(255,64,112,.38); }
+.badge-warn    { background:rgba(255,204,0,.1); color:var(--yellow); border:1px solid rgba(255,204,0,.4); }
+@keyframes dotpulse { 0%,100%{opacity:1} 50%{opacity:.15} }
 
-        /* Config card */
-        .card {
-            background: var(--surface);
-            border-radius: var(--radius);
-            padding: 1.5rem;
-            margin-bottom: 1.5rem;
-            border: 1px solid var(--border);
-        }
-        .card h2 { font-size: 1.05rem; font-weight: 600; margin-bottom: 1.1rem; color: var(--blue); }
+/* Main layout */
+.main { max-width: 1360px; margin: 0 auto; padding: 1.5rem 1.2rem 3rem; }
 
-        .form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; }
-        .form-grid .full { grid-column: 1 / -1; }
+/* Error/info banner */
+.banner { padding:.7rem 1rem; border-radius:9px; margin-bottom:1.2rem; font-size:.88rem; font-weight:500; }
+.banner-err  { background:rgba(255,64,112,.12); color:#ffb3c1; border:1px solid rgba(255,64,112,.38); }
+.banner-info { background:rgba(0,212,255,.08); color:var(--muted); border:1px solid rgba(0,212,255,.2); }
 
-        label { display: block; font-size: .8rem; font-weight: 600; color: var(--muted); margin-bottom: .3rem; }
-        input[type="text"], input[type="password"], input[type="email"] {
-            width: 100%; padding: .6rem .85rem;
-            background: var(--surface2); border: 1.5px solid var(--border);
-            border-radius: 8px; color: var(--text); font-size: .92rem; font-family: inherit;
-            transition: border-color .2s;
-        }
-        input:focus { outline: none; border-color: var(--blue); }
+/* Section title */
+.section-title {
+  font-size:.65rem; font-weight:700; text-transform:uppercase; letter-spacing:.12em;
+  color:var(--muted); font-family:'Courier New',monospace; margin-bottom:.8rem;
+  padding-bottom:.4rem; border-bottom:1px solid rgba(0,212,255,.15);
+}
 
-        .btn {
-            display: inline-flex; align-items: center; gap: .4rem;
-            padding: .65rem 1.4rem; border: none; border-radius: 8px;
-            font-size: .9rem; font-weight: 600; cursor: pointer; font-family: inherit;
-            transition: filter .15s, transform .1s;
-        }
-        .btn:hover  { filter: brightness(1.1); }
-        .btn:active { transform: scale(.97); }
-        .btn-primary { background: var(--blue);  color: #fff; }
-        .btn-ghost   { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+/* Power flow overview */
+.flow-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.1rem 1.3rem 1rem;
+  margin-bottom: 1.4rem;
+  backdrop-filter: blur(18px);
+}
+.flow-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: .5rem;
+  align-items: center;
+  margin-top: .6rem;
+}
+.flow-node {
+  text-align: center;
+  background: rgba(0,0,0,.35);
+  border: 1px solid rgba(0,212,255,.2);
+  border-radius: 10px;
+  padding: .55rem .4rem;
+}
+.fn-icon { font-size: 1.3rem; }
+.fn-val  { font-size: .95rem; font-weight:700; font-family:'Courier New',monospace; margin:.2rem 0 .1rem; }
+.fn-lbl  { font-size: .55rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
+.flow-arrow { text-align:center; font-size:1.2rem; color:rgba(0,212,255,.5); }
 
-        /* Status badge */
-        .status-badge {
-            display: inline-flex; align-items: center; gap: .4rem;
-            padding: .3rem .8rem; border-radius: 999px; font-size: .78rem; font-weight: 700;
-        }
-        .status-on  { background: #052e16; color: #6ee7b7; border: 1px solid #065f46; }
-        .status-off { background: #450a0a; color: #fca5a5; border: 1px solid #7f1d1d; }
+/* Battery cards grid */
+.bat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 1.2rem;
+  margin-bottom: 1.4rem;
+}
 
-        /* Metrics grid */
-        .metrics-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-            gap: 1rem;
-        }
-        .metric-card {
-            background: var(--surface2);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            padding: 1.1rem 1rem;
-            text-align: center;
-            transition: transform .15s, border-color .15s;
-        }
-        .metric-card:hover { transform: translateY(-2px); border-color: var(--blue); }
-        .metric-icon  { font-size: 1.6rem; margin-bottom: .4rem; }
-        .metric-value { font-size: 1.4rem; font-weight: 700; color: var(--text); }
-        .metric-value .unit { font-size: .75rem; font-weight: 400; color: var(--muted); margin-left: .2rem; }
-        .metric-label { font-size: .72rem; color: var(--muted); margin-top: .3rem; }
+/* Battery card */
+.bat-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.1rem 1.3rem;
+  backdrop-filter: blur(18px);
+  transition: border-color .25s;
+}
+.bat-card:hover { border-color: var(--border-h); }
 
-        /* Station list */
-        .station-list { display: flex; flex-direction: column; gap: .75rem; }
-        .station-item {
-            background: var(--surface2);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            padding: 1rem 1.25rem;
-            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .75rem;
-        }
-        .station-name { font-weight: 600; font-size: 1rem; }
-        .station-meta { font-size: .78rem; color: var(--muted); margin-top: .2rem; }
+.bat-header {
+  display: flex; align-items: center; gap: .75rem; margin-bottom: 1rem;
+}
+.bat-num {
+  width: 32px; height: 32px; border-radius: 9px;
+  display:flex; align-items:center; justify-content:center;
+  font-size: 1.2rem; flex-shrink: 0;
+  background: rgba(192, 132, 252, .2); border:1px solid rgba(192,132,252,.45);
+}
+.bat-title { font-size: 1rem; font-weight:700; }
+.bat-subtitle { font-size: .68rem; color:var(--muted); font-family:'Courier New',monospace; margin-top:.12rem; }
 
-        /* Device list */
-        .device-list { display: flex; flex-direction: column; gap: .6rem; margin-top: 1rem; }
-        .device-item {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-left: 3px solid var(--blue);
-            border-radius: 8px;
-            padding: .75rem 1rem;
-            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .5rem;
-        }
-        .device-sn { font-family: monospace; font-size: .85rem; color: var(--amber); }
+/* SOC display */
+.soc-wrap {
+  display: flex; align-items: center; gap: 1.2rem; margin-bottom: 1rem;
+}
+.soc-ring { position:relative; width:88px; height:88px; flex-shrink:0; }
+.soc-ring svg { width:100%; height:100%; transform:rotate(-90deg); }
+.soc-ring .ring-bg  { fill:none; stroke:rgba(0,212,255,.12); stroke-width:7; }
+.soc-ring .ring-val { fill:none; stroke-width:7; stroke-linecap:round; transition:stroke-dashoffset .8s cubic-bezier(.4,0,.2,1); }
+.soc-ring-center {
+  position:absolute; inset:0; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; text-align:center;
+}
+.soc-pct   { font-size:1.25rem; font-weight:800; font-family:'Courier New',monospace; line-height:1; }
+.soc-label { font-size:.55rem; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; margin-top:.1rem; }
 
-        /* Section heading */
-        .section-title {
-            font-size: 1.15rem; font-weight: 700; margin-bottom: 1rem;
-            padding-bottom: .5rem; border-bottom: 1px solid var(--border);
-            display: flex; align-items: center; gap: .6rem;
-        }
+.soc-info { flex:1; }
+.soc-status {
+  display:inline-flex; align-items:center; gap:.35rem;
+  font-size:.8rem; font-weight:700; margin-bottom:.5rem;
+}
+.soc-status .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+.charging    .dot { background:var(--green); box-shadow:0 0 8px var(--green); animation:dotpulse 1.5s ease-in-out infinite; }
+.discharging .dot { background:var(--amber); box-shadow:0 0 8px var(--amber); }
+.idle        .dot { background:var(--muted); }
 
-        .tag {
-            display: inline-block; padding: .15rem .55rem;
-            background: var(--surface2); border: 1px solid var(--border);
-            border-radius: 6px; font-size: .72rem; color: var(--muted);
-        }
+.power-val {
+  font-size:1.4rem; font-weight:800; font-family:'Courier New',monospace;
+  text-shadow: 0 0 18px currentColor;
+}
+.power-dir { font-size:.65rem; color:var(--muted); margin-top:.08rem; font-family:'Courier New',monospace; }
 
-        .help-text { font-size: .8rem; color: var(--muted); line-height: 1.55; }
-        .help-text a { color: var(--blue); text-decoration: none; }
-        .help-text a:hover { text-decoration: underline; }
+/* Progress bars */
+.bar-block { margin-bottom: .6rem; }
+.bar-label { display:flex; justify-content:space-between; font-size:.65rem; color:var(--muted); margin-bottom:.28rem; font-family:'Courier New',monospace; }
+.bar-track { height:5px; background:rgba(0,212,255,.1); border-radius:3px; overflow:hidden; }
+.bar-fill  { height:100%; border-radius:3px; transition:width .7s cubic-bezier(.4,0,.2,1); }
+.fill-green  { background:linear-gradient(90deg,var(--green),var(--blue)); box-shadow:0 0 8px rgba(0,255,184,.5); }
+.fill-yellow { background:linear-gradient(90deg,var(--yellow),#ff8800); box-shadow:0 0 8px rgba(255,204,0,.4); }
+.fill-red    { background:linear-gradient(90deg,var(--red),#ff0050); box-shadow:0 0 8px rgba(255,64,112,.5); }
+.fill-purple { background:linear-gradient(90deg,var(--purple),#7c3aed); box-shadow:0 0 8px rgba(192,132,252,.4); }
 
-        .last-updated { font-size: .75rem; color: var(--muted); text-align: right; margin-top: .5rem; }
+/* Stats grid */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: .55rem;
+  margin-top: .85rem;
+}
+.stat-cell {
+  background: rgba(0,212,255,.04);
+  border: 1px solid rgba(0,212,255,.12);
+  border-radius: 8px;
+  padding: .5rem .55rem;
+  text-align: center;
+}
+.stat-lbl { font-size:.55rem; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-family:'Courier New',monospace; }
+.stat-val { font-size:.88rem; font-weight:700; margin-top:.25rem; font-family:'Courier New',monospace; text-shadow:0 0 12px rgba(0,238,255,.45); }
+.stat-unit { font-size:.58rem; color:var(--muted); margin-left:.1rem; font-weight:400; }
+.stat-val.warn { color:var(--yellow); }
+.stat-val.crit { color:var(--red); }
+.stat-val.good { color:var(--green); }
 
-        @media (max-width: 600px) {
-            .metrics-grid { grid-template-columns: repeat(2, 1fr); }
-        }
-    </style>
+/* Cycles highlight */
+.cycles-highlight {
+  background: rgba(192, 132, 252, .1);
+  border: 1px solid rgba(192,132,252,.3);
+  border-radius: 8px;
+  padding: .5rem .7rem;
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: .6rem;
+}
+.cycles-lbl { font-size:.65rem; color:var(--purple); font-family:'Courier New',monospace; text-transform:uppercase; letter-spacing:.08em; }
+.cycles-num { font-size:1.2rem; font-weight:800; font-family:'Courier New',monospace; color:var(--purple); text-shadow:0 0 14px rgba(192,132,252,.6); }
+
+/* Data table */
+.data-table-wrap { overflow-x:auto; margin-top:.6rem; }
+table { width:100%; border-collapse:collapse; font-size:.78rem; }
+th, td { padding:.38rem .65rem; text-align:left; border-bottom:1px solid rgba(0,212,255,.09); }
+th { font-size:.62rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); font-family:'Courier New',monospace; font-weight:600; background:rgba(0,0,0,.25); }
+td.key-col { font-family:'Courier New',monospace; font-size:.72rem; color:var(--cyan); }
+td.val-col { font-family:'Courier New',monospace; font-weight:700; }
+td.unit-col { color:var(--muted); }
+tr:hover td { background:rgba(0,212,255,.04); }
+
+/* Collapsible section */
+.collapse-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 1.2rem;
+  backdrop-filter: blur(18px);
+  overflow: hidden;
+}
+.collapse-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: .85rem 1.3rem; cursor: pointer; user-select: none;
+  transition: background .15s;
+}
+.collapse-header:hover { background: rgba(0,212,255,.05); }
+.collapse-title { font-size:.88rem; font-weight:600; display:flex; align-items:center; gap:.5rem; }
+.collapse-arrow { font-size:.75rem; color:var(--muted); transition:transform .25s; }
+.collapse-body { padding: 0 1.3rem 1.1rem; }
+.collapse-body.hidden { display:none; }
+.collapse-arrow.open { transform:rotate(90deg); }
+
+/* Sub-sections */
+.sub-section { margin-bottom: 1.2rem; }
+.sub-section:last-child { margin-bottom: 0; }
+.sub-title {
+  font-size:.65rem; font-weight:700; text-transform:uppercase; letter-spacing:.1em;
+  color:var(--blue); font-family:'Courier New',monospace; margin-bottom:.5rem;
+  padding-bottom:.3rem; border-bottom:1px solid rgba(56,200,255,.2);
+}
+
+/* No data state */
+.no-data { color:var(--muted); font-size:.82rem; font-style:italic; padding:.4rem 0; }
+
+/* Footer */
+footer {
+  text-align:center; font-size:.7rem; color:var(--muted); font-family:'Courier New',monospace;
+  padding:1rem 0 2rem; letter-spacing:.05em;
+}
+
+@media (max-width: 640px) {
+  .bat-grid { grid-template-columns: 1fr; }
+  .flow-grid { grid-template-columns: repeat(3, 1fr); }
+  .flow-arrow { display:none; }
+  header { padding:.7rem 1rem; }
+}
+</style>
 </head>
 <body>
 
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+<div class="orb orb-3"></div>
+
 <header>
-    <div>
-        <h1>☀️ Deye Inverter Dashboard</h1>
-        <div class="header-sub">Connected via Solarman Cloud API</div>
-    </div>
-    <?php if ($credentialsProvided && !$error): ?>
-    <div>
-        <span class="status-badge status-on">● Connected</span>
-    </div>
-    <?php elseif ($credentialsProvided && $error): ?>
-    <div>
-        <span class="status-badge status-off">● Error</span>
-    </div>
+  <h1>🔋 <span class="grad">Deye Battery Dashboard</span></h1>
+  <div class="header-right">
+    <?php if ($authError !== null): ?>
+      <span class="badge badge-err">Auth Failed</span>
+    <?php elseif ($token !== '' && $allPoints !== []): ?>
+      <span class="badge badge-ok">Connected</span>
+    <?php elseif ($token !== ''): ?>
+      <span class="badge badge-warn">No Data</span>
     <?php endif; ?>
+    <span class="update-time" id="update-time">
+      <?= $collectTime !== '' ? 'Collected: ' . e($collectTime) : ($stLastUp !== null ? 'Updated: ' . e((string)$stLastUp) : 'Loaded: ' . date('H:i:s')) ?>
+    </span>
+    <button class="refresh-btn" onclick="location.reload()">↺ Refresh</button>
+  </div>
 </header>
 
-<div class="container">
+<div class="main">
 
-    <?php if ($error !== null): ?>
-    <div class="flash error">⚠️ <?= e($error) ?></div>
-    <?php endif; ?>
-
-    <!-- Credentials form -->
-    <div class="card">
-        <h2>🔑 API Credentials</h2>
-        <p class="help-text" style="margin-bottom:1rem;">
-            Enter your <strong>Solarman developer</strong> credentials.
-            Register at <a href="https://home.solarmanpv.com" target="_blank" rel="noopener">home.solarmanpv.com</a>
-            and create an app to obtain <em>App ID</em> and <em>App Secret</em>.
-            You can also set these as environment variables:
-            <code>DEYE_APP_ID</code>, <code>DEYE_APP_SECRET</code>,
-            <code>DEYE_EMAIL</code>, <code>DEYE_PASSWORD</code>, <code>DEYE_DEVICE_SN</code>.
-        </p>
-        <form method="POST" action="">
-            <div class="form-grid">
-                <div>
-                    <label for="app_id">App ID</label>
-                    <input type="text" id="app_id" name="app_id"
-                           placeholder="e.g. 202906251498"
-                           value="<?= e($CONFIG['app_id']) ?>">
-                </div>
-                <div>
-                    <label for="app_secret">App Secret</label>
-                    <input type="password" id="app_secret" name="app_secret"
-                           value="<?= e($CONFIG['app_secret']) ?>">
-                </div>
-                <div>
-                    <label for="email">Account Email</label>
-                    <input type="email" id="email" name="email"
-                           placeholder="you@example.com"
-                           value="<?= e($CONFIG['email']) ?>">
-                </div>
-                <div>
-                    <label for="password">Account Password</label>
-                    <input type="password" id="password" name="password">
-                </div>
-                <div>
-                    <label for="device_sn">Device Serial Number <span class="tag">optional</span></label>
-                    <input type="text" id="device_sn" name="device_sn"
-                           placeholder="Leave blank to auto-detect"
-                           value="<?= e($CONFIG['device_sn']) ?>">
-                </div>
-                <div style="align-self:flex-end;">
-                    <button type="submit" class="btn btn-primary">🔍 Connect &amp; Fetch</button>
-                </div>
-            </div>
-        </form>
-    </div>
-
-    <?php if (!empty($realtimeData)): ?>
-    <!-- Real-time metrics -->
-    <div class="card">
-        <div class="section-title">⚡ Real-time Inverter Data
-            <?php if (!empty($result['deviceSn'])): ?>
-            <span class="tag">SN: <?= e($result['deviceSn']) ?></span>
-            <?php endif; ?>
-        </div>
-        <div class="metrics-grid">
-            <?php foreach ($realtimeData as $point): ?>
-            <?= renderMetricCard($point) ?>
-            <?php endforeach; ?>
-        </div>
-        <div class="last-updated">Last updated: <?= date('Y-m-d H:i:s') ?></div>
-    </div>
-    <?php endif; ?>
-
-    <?php if (!empty($stations)): ?>
-    <!-- Station list -->
-    <div class="card">
-        <div class="section-title">🏭 Stations (<?= count($stations) ?>)</div>
-        <div class="station-list">
-            <?php foreach ($stations as $station): ?>
-            <div class="station-item">
-                <div>
-                    <div class="station-name"><?= e((string)($station['name'] ?? 'Unnamed Station')) ?></div>
-                    <div class="station-meta">
-                        ID: <?= e((string)($station['id'] ?? '—')) ?>
-                        <?php if (!empty($station['locationAddress'])): ?>
-                        &bull; <?= e($station['locationAddress']) ?>
-                        <?php endif; ?>
-                        <?php if (!empty($station['capacity'])): ?>
-                        &bull; Capacity: <?= e((string)$station['capacity']) ?> kWp
-                        <?php endif; ?>
-                    </div>
-                </div>
-                <div>
-                    <?php
-                    $powerStr = $station['generationPower'] ?? null;
-                    if ($powerStr !== null):
-                    ?>
-                    <span class="status-badge status-on">
-                        ⚡ <?= e((string)$powerStr) ?> W
-                    </span>
-                    <?php endif; ?>
-                </div>
-            </div>
-            <?php endforeach; ?>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <?php if (!empty($devices)): ?>
-    <!-- Device list -->
-    <div class="card">
-        <div class="section-title">🔧 Devices — copy a Serial Number above to fetch live data</div>
-        <div class="device-list">
-            <?php foreach ($devices as $dev): ?>
-            <div class="device-item">
-                <div>
-                    <div><?= e((string)($dev['deviceName'] ?? $dev['deviceType'] ?? 'Device')) ?></div>
-                    <div class="device-sn"><?= e((string)($dev['deviceSn'] ?? '')) ?></div>
-                </div>
-                <span class="tag"><?= e((string)($dev['deviceType'] ?? 'inverter')) ?></span>
-            </div>
-            <?php endforeach; ?>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <?php if (!$credentialsProvided): ?>
-    <!-- Getting started -->
-    <div class="card">
-        <div class="section-title">📖 Getting Started</div>
-        <ol style="padding-left:1.25rem; line-height:2; color:var(--muted); font-size:.9rem;">
-            <li>Create a developer account at <a href="https://home.solarmanpv.com" style="color:var(--blue);">home.solarmanpv.com</a></li>
-            <li>Go to <strong>Developer → App Management</strong> and create a new app</li>
-            <li>Copy your <strong>App ID</strong> and <strong>App Secret</strong></li>
-            <li>Enter them above along with your Solarman account credentials</li>
-            <li>Optionally enter your inverter's serial number (printed on the label) to jump straight to live data</li>
-        </ol>
-    </div>
-    <?php endif; ?>
-
+<?php if ($authError !== null): ?>
+<div class="banner banner-err">
+  ⚠️ Authentication failed — <?= e((string)$authError) ?><br>
+  <small style="opacity:.7">Check API credentials and IP allowlist at developer.deyecloud.com</small>
 </div>
+<?php endif; ?>
+
+<?php if ($apiError !== null): ?>
+<div class="banner banner-err">⚠️ <?= e($apiError) ?></div>
+<?php endif; ?>
+
+<?php if ($token !== '' && $allPoints === [] && $apiError === null): ?>
+<div class="banner banner-info">
+  ℹ️ Authenticated but no device data returned. The inverter may be offline or device SN
+  (<?= e(DEYE_SN_HINT) ?>) may need updating.
+  <?php if (!empty($ltResp ?? [])): ?>
+  Raw response: <code><?= e(substr(json_encode($ltResp ?? []), 0, 200)) ?></code>
+  <?php endif; ?>
+</div>
+<?php endif; ?>
+
+<!-- ── Power Flow Overview ──────────────────────────────────────────────────── -->
+<div class="flow-card">
+  <div class="section-title">⚡ Real-time Power Flow — Station <?= DEYE_STATION ?></div>
+  <div class="flow-grid">
+
+    <?php
+    $fmtW = function(mixed $w): string {
+        if ($w === null) return '—';
+        $a = abs((float)$w);
+        return $a >= 1000 ? round($a/1000, 2).' kW' : round($a).' W';
+    };
+    $solarW = max(0, (float)($stGenPower ?? 0));
+    $gridW  = (float)($stGridPower  ?? 0);
+    $batW   = (float)($stBatPower   ?? $bat1['power'] ?? 0);
+    $loadW  = max(0, (float)($stLoadPower  ?? 0));
+    $soc    = $bat1['soc'] ?? $stBatSoc ?? null;
+
+    $gridDir  = $gridW > 20  ? 'Importing' : ($gridW < -20 ? 'Exporting' : 'On grid');
+    $batDir   = $batW  < -20 ? 'Charging'  : ($batW  > 20  ? 'Discharging' : 'Idle');
+    $batCol   = socColor($soc);
+    ?>
+
+    <div class="flow-node">
+      <div class="fn-icon">☀️</div>
+      <div class="fn-val" style="color:var(--amber)"><?= $fmtW($solarW) ?></div>
+      <div class="fn-lbl">Solar</div>
+    </div>
+
+    <div class="flow-arrow"><?= $solarW > 20 ? '→' : '·' ?></div>
+
+    <div class="flow-node">
+      <div class="fn-icon">⚡</div>
+      <div class="fn-val" style="color:var(--cyan)">Inverter</div>
+      <div class="fn-lbl"><?= $stDayKwh !== null ? round((float)$stDayKwh,1).' kWh today' : 'Station '.DEYE_STATION ?></div>
+    </div>
+
+    <div class="flow-arrow"><?= $loadW > 20 ? '→' : '·' ?></div>
+
+    <div class="flow-node">
+      <div class="fn-icon">🏠</div>
+      <div class="fn-val" style="color:var(--green)"><?= $fmtW($loadW) ?></div>
+      <div class="fn-lbl">Load</div>
+    </div>
+
+    <!-- Row 2: Grid and Battery below inverter -->
+    <div class="flow-node" style="grid-column:1">
+      <div class="fn-icon">🔌</div>
+      <div class="fn-val" style="color:var(--blue)"><?= $fmtW(abs($gridW)) ?></div>
+      <div class="fn-lbl"><?= e($gridDir) ?></div>
+    </div>
+
+    <div class="flow-arrow"></div>
+
+    <div class="flow-node" style="background:rgba(192,132,252,.1);border-color:rgba(192,132,252,.35)">
+      <div class="fn-icon">🔋</div>
+      <div class="fn-val" style="color:<?= $batCol ?>">
+        <?= $soc !== null ? round((float)$soc).'%' : '—' ?>
+      </div>
+      <div class="fn-lbl"><?= e($batDir) ?> · <?= $fmtW(abs($batW)) ?></div>
+    </div>
+
+    <div class="flow-arrow"></div>
+
+    <div class="flow-node">
+      <div class="fn-icon">📊</div>
+      <div class="fn-val" style="color:var(--muted);font-size:.78rem">
+        <?= $stTotKwh !== null ? round((float)$stTotKwh).' kWh' : '—' ?>
+      </div>
+      <div class="fn-lbl">Total energy</div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Dual Battery Cards ────────────────────────────────────────────────────── -->
+<div class="section-title">🔋 Battery Status</div>
+<div class="bat-grid">
+
+<?php
+foreach (['1' => $bat1, '2' => $bat2] as $num => $bat):
+    $soc     = $bat['soc'];
+    $soh     = $bat['soh'];
+    $volt    = $bat['volt'];
+    $curr    = $bat['curr'];
+    $power   = $bat['power'];
+    $temp    = $bat['temp'];
+    $cycles  = $bat['cycles'];
+    $status  = $bat['status'];
+    $cap     = $bat['cap'];
+    $maxv    = $bat['maxv'];
+    $minv    = $bat['minv'];
+
+    [$pwrLabel, $pwrArrow, $pwrClass] = powerLabel($power);
+
+    $socVal    = $soc !== null ? (int) round((float)$soc) : null;
+    $sohVal    = $soh !== null ? (int) round((float)$soh) : null;
+    $col       = socColor($soc);
+
+    // SOC ring: circumference of circle r=38 is ~238.76
+    $circ      = 238.76;
+    $dashOffset = $socVal !== null ? round($circ * (1 - $socVal / 100), 2) : $circ;
+
+    $socBarClass = $socVal === null ? 'fill-green' : ($socVal >= 50 ? 'fill-green' : ($socVal >= 20 ? 'fill-yellow' : 'fill-red'));
+    $sohBarClass = $sohVal === null ? 'fill-purple' : ($sohVal >= 80 ? 'fill-purple' : ($sohVal >= 60 ? 'fill-yellow' : 'fill-red'));
+    $tempVal   = $temp !== null ? round((float)$temp, 1) : null;
+    $tempClass = $tempVal === null ? '' : ($tempVal >= 45 ? 'crit' : ($tempVal >= 35 ? 'warn' : 'good'));
+
+    $hasData   = ($socVal !== null || $volt !== null || $cycles !== null);
+    if ($num === '2' && !$hasBat2 && !$hasData):
+?>
+  <!-- Battery 2: no dedicated data -->
+  <div class="bat-card" style="opacity:.5">
+    <div class="bat-header">
+      <div class="bat-num">🔋</div>
+      <div>
+        <div class="bat-title">Battery <?= $num ?></div>
+        <div class="bat-subtitle">No separate data — may share BMS with Battery 1</div>
+      </div>
+    </div>
+    <p class="no-data">No individual measure points found for battery <?= $num ?>.<br>
+    Check the raw data section below for all available keys.</p>
+  </div>
+<?php else: ?>
+  <div class="bat-card">
+    <div class="bat-header">
+      <div class="bat-num">🔋</div>
+      <div>
+        <div class="bat-title">Battery <?= $num ?></div>
+        <div class="bat-subtitle">
+          <?php if ($deviceSn !== ''): ?>SN&nbsp;<code><?= e($deviceSn) ?></code>&nbsp;·&nbsp;<?php endif; ?>
+          <?= $status !== null ? e(batStatus($status)) : 'Lithium Ion Pack' ?>
+        </div>
+      </div>
+      <?php if ($status !== null): ?>
+      <span class="badge <?= (int)$status === 1 ? 'badge-ok' : ((int)$status === 3 ? 'badge-err' : 'badge-warn') ?>" style="margin-left:auto">
+        <?= e(batStatus($status)) ?>
+      </span>
+      <?php elseif ($pwrClass === 'charging'): ?>
+      <span class="badge badge-ok" style="margin-left:auto">Charging</span>
+      <?php elseif ($pwrClass === 'discharging'): ?>
+      <span class="badge badge-warn" style="margin-left:auto">Discharging</span>
+      <?php endif; ?>
+    </div>
+
+    <!-- SOC + Power -->
+    <div class="soc-wrap">
+      <div class="soc-ring">
+        <svg viewBox="0 0 88 88">
+          <circle class="ring-bg" cx="44" cy="44" r="38"/>
+          <circle class="ring-val" cx="44" cy="44" r="38"
+            stroke="<?= $col ?>"
+            stroke-dasharray="<?= $circ ?>"
+            stroke-dashoffset="<?= $dashOffset ?>"/>
+        </svg>
+        <div class="soc-ring-center">
+          <div class="soc-pct" style="color:<?= $col ?>"><?= $socVal !== null ? $socVal.'%' : '—' ?></div>
+          <div class="soc-label">SoC</div>
+        </div>
+      </div>
+      <div class="soc-info">
+        <div class="soc-status <?= $pwrClass ?>">
+          <span class="dot"></span>
+          <span><?= $pwrArrow ?> <?= e($pwrLabel) ?></span>
+        </div>
+        <?php if ($power !== null): ?>
+        <div class="power-val" style="color:<?= $pwrClass === 'charging' ? 'var(--green)' : ($pwrClass === 'discharging' ? 'var(--amber)' : 'var(--muted)') ?>">
+          <?= abs(round((float)$power)) ?><span style="font-size:.7rem;font-weight:400;color:var(--muted);margin-left:.2rem">W</span>
+        </div>
+        <div class="power-dir"><?= $pwrClass === 'charging' ? 'Inverter → Battery' : ($pwrClass === 'discharging' ? 'Battery → Inverter' : 'No flow') ?></div>
+        <?php else: ?>
+        <div class="power-val" style="color:var(--muted)">—</div>
+        <?php endif; ?>
+      </div>
+    </div>
+
+    <!-- SoC bar -->
+    <div class="bar-block">
+      <div class="bar-label"><span>State of Charge</span><span><?= $socVal !== null ? $socVal.'%' : '—' ?></span></div>
+      <div class="bar-track"><div class="bar-fill <?= $socBarClass ?>" style="width:<?= $socVal ?? 0 ?>%"></div></div>
+    </div>
+
+    <!-- SoH bar -->
+    <?php if ($sohVal !== null): ?>
+    <div class="bar-block">
+      <div class="bar-label"><span>State of Health (SoH)</span><span><?= $sohVal ?>%</span></div>
+      <div class="bar-track"><div class="bar-fill <?= $sohBarClass ?>" style="width:<?= $sohVal ?>%"></div></div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Temperature bar -->
+    <?php if ($tempVal !== null): ?>
+    <div class="bar-block">
+      <?php $tp = min(100, (int)round($tempVal / 60 * 100)); ?>
+      <div class="bar-label"><span>Temperature</span><span><?= $tempVal ?>°C</span></div>
+      <div class="bar-track"><div class="bar-fill <?= $tempVal >= 45 ? 'fill-red' : ($tempVal >= 35 ? 'fill-yellow' : 'fill-green') ?>" style="width:<?= $tp ?>%"></div></div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Stats grid -->
+    <div class="stats-grid">
+      <div class="stat-cell">
+        <div class="stat-lbl">Voltage</div>
+        <div class="stat-val"><?= $volt !== null ? round((float)$volt,1) : '—' ?><span class="stat-unit">V</span></div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-lbl">Current</div>
+        <div class="stat-val"><?= $curr !== null ? round((float)$curr,1) : '—' ?><span class="stat-unit">A</span></div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-lbl">Temp</div>
+        <div class="stat-val <?= $tempClass ?>"><?= $tempVal !== null ? $tempVal : '—' ?><span class="stat-unit">°C</span></div>
+      </div>
+      <div class="stat-cell">
+        <div class="stat-lbl">Capacity</div>
+        <div class="stat-val"><?= $cap !== null ? round((float)$cap) : '—' ?><span class="stat-unit">Ah</span></div>
+      </div>
+      <?php if ($maxv !== null): ?>
+      <div class="stat-cell">
+        <div class="stat-lbl">Cell Max V</div>
+        <div class="stat-val"><?= round((float)$maxv,3) ?><span class="stat-unit">V</span></div>
+      </div>
+      <?php endif; ?>
+      <?php if ($minv !== null): ?>
+      <div class="stat-cell">
+        <div class="stat-lbl">Cell Min V</div>
+        <div class="stat-val"><?= round((float)$minv,3) ?><span class="stat-unit">V</span></div>
+      </div>
+      <?php endif; ?>
+    </div>
+
+    <!-- Cycles highlight -->
+    <?php if ($cycles !== null): ?>
+    <div class="cycles-highlight">
+      <div>
+        <div class="cycles-lbl">Charge Cycles</div>
+        <div style="font-size:.6rem;color:var(--muted);margin-top:.1rem">Full charge/discharge cycles</div>
+      </div>
+      <div class="cycles-num"><?= number_format((int)round((float)$cycles)) ?></div>
+    </div>
+    <?php else: ?>
+    <div class="cycles-highlight" style="opacity:.4">
+      <div class="cycles-lbl">Charge Cycles</div>
+      <div class="cycles-num">—</div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Health summary text -->
+    <?php if ($sohVal !== null): ?>
+    <div style="margin-top:.6rem;font-size:.72rem;color:var(--muted);line-height:1.5">
+      <?php if ($sohVal >= 90): ?>
+        <span style="color:var(--green)">✓ Excellent health</span> — battery is performing near new capacity.
+      <?php elseif ($sohVal >= 75): ?>
+        <span style="color:#7dd3fc">✓ Good health</span> — some capacity degradation, normal for age/cycles.
+      <?php elseif ($sohVal >= 60): ?>
+        <span style="color:var(--yellow)">⚠ Fair health</span> — noticeable capacity reduction. Monitor closely.
+      <?php else: ?>
+        <span style="color:var(--red)">✗ Poor health</span> — significant capacity loss. Consider replacement.
+      <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+  </div>
+<?php endif; endforeach; ?>
+
+</div><!-- /.bat-grid -->
+
+<!-- ── Combined Battery Points ───────────────────────────────────────────────── -->
+<?php if (!empty($sections['bat_combined']) || !empty($sections['bat1']) || !empty($sections['bat2'])): ?>
+<div class="collapse-card" id="cc-battery">
+  <div class="collapse-header" onclick="toggleCollapse('cc-battery')">
+    <div class="collapse-title">🔋 All Battery Measure Points
+      <span class="badge badge-ok" style="font-size:.6rem"><?= count($sections['bat_combined']) + count($sections['bat1']) + count($sections['bat2']) ?> points</span>
+    </div>
+    <span class="collapse-arrow open" id="arr-cc-battery">▶</span>
+  </div>
+  <div class="collapse-body" id="body-cc-battery">
+    <?php
+    $subSections = [
+        'Battery 1 Points'  => $sections['bat1'],
+        'Battery 2 Points'  => $sections['bat2'],
+        'Combined / BMS'    => $sections['bat_combined'],
+    ];
+    foreach ($subSections as $subTitle => $points):
+        if (empty($points)) continue;
+    ?>
+    <div class="sub-section">
+      <div class="sub-title"><?= e($subTitle) ?> (<?= count($points) ?>)</div>
+      <div class="data-table-wrap">
+        <table>
+          <thead><tr><th>Key</th><th>Name</th><th>Value</th><th>Unit</th></tr></thead>
+          <tbody>
+            <?php foreach ($points as $p): ?>
+            <tr>
+              <td class="key-col"><?= e($p['key'] ?? '') ?></td>
+              <td><?= e($p['name'] ?? '') ?></td>
+              <td class="val-col"><?= e((string)($p['value'] ?? '—')) ?></td>
+              <td class="unit-col"><?= e($p['unit'] ?? '') ?></td>
+            </tr>
+            <?php endforeach; ?>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <?php endforeach; ?>
+  </div>
+</div>
+<?php endif; ?>
+
+<!-- ── Other Data Sections ───────────────────────────────────────────────────── -->
+<?php
+$otherSections = [
+    ['id' => 'cc-pv',       'icon' => '☀️', 'label' => 'PV / Solar Strings',   'data' => $sections['pv']],
+    ['id' => 'cc-grid',     'icon' => '🔌', 'label' => 'Grid',                 'data' => $sections['grid']],
+    ['id' => 'cc-load',     'icon' => '🏠', 'label' => 'Load / Consumption',   'data' => $sections['load']],
+    ['id' => 'cc-inv',      'icon' => '⚙️', 'label' => 'Inverter / Status',    'data' => $sections['inverter']],
+    ['id' => 'cc-other',    'icon' => '📋', 'label' => 'Other Points',         'data' => $sections['other']],
+];
+foreach ($otherSections as $sec):
+    if (empty($sec['data'])) continue;
+?>
+<div class="collapse-card" id="<?= $sec['id'] ?>">
+  <div class="collapse-header" onclick="toggleCollapse('<?= $sec['id'] ?>')">
+    <div class="collapse-title"><?= $sec['icon'] ?> <?= e($sec['label']) ?>
+      <span class="badge" style="font-size:.6rem;background:rgba(0,212,255,.08);color:var(--muted);border:1px solid rgba(0,212,255,.2)"><?= count($sec['data']) ?></span>
+    </div>
+    <span class="collapse-arrow" id="arr-<?= $sec['id'] ?>">▶</span>
+  </div>
+  <div class="collapse-body hidden" id="body-<?= $sec['id'] ?>">
+    <div class="data-table-wrap">
+      <table>
+        <thead><tr><th>Key</th><th>Name</th><th>Value</th><th>Unit</th></tr></thead>
+        <tbody>
+          <?php foreach ($sec['data'] as $p): ?>
+          <tr>
+            <td class="key-col"><?= e($p['key'] ?? '') ?></td>
+            <td><?= e($p['name'] ?? '') ?></td>
+            <td class="val-col"><?= e((string)($p['value'] ?? '—')) ?></td>
+            <td class="unit-col"><?= e($p['unit'] ?? '') ?></td>
+          </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<?php endforeach; ?>
+
+<!-- ── Raw API debug (hidden by default) ─────────────────────────────────────── -->
+<?php if (!empty($allPoints)): ?>
+<div class="collapse-card" id="cc-raw">
+  <div class="collapse-header" onclick="toggleCollapse('cc-raw')">
+    <div class="collapse-title">🔍 All <?= count($allPoints) ?> Device Data Points (raw dump)</div>
+    <span class="collapse-arrow" id="arr-cc-raw">▶</span>
+  </div>
+  <div class="collapse-body hidden" id="body-cc-raw">
+    <div class="data-table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Key</th><th>Name</th><th>Value</th><th>Unit</th></tr></thead>
+        <tbody>
+          <?php foreach ($allPoints as $i => $p): ?>
+          <tr>
+            <td style="color:var(--muted)"><?= $i+1 ?></td>
+            <td class="key-col"><?= e($p['key'] ?? '') ?></td>
+            <td><?= e($p['name'] ?? '') ?></td>
+            <td class="val-col"><?= e((string)($p['value'] ?? '—')) ?></td>
+            <td class="unit-col"><?= e($p['unit'] ?? '') ?></td>
+          </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
+
+</div><!-- /.main -->
+
+<footer>
+  Deye Cloud OpenAPI · eu1-developer.deyecloud.com · Station <?= DEYE_STATION ?> · Device <?= e($deviceSn ?: DEYE_SN_HINT) ?><br>
+  <span id="auto-refresh-msg">Auto-refreshes every 30 s</span>
+</footer>
+
+<script>
+// ── Collapsible sections ──────────────────────────────────────────────────────
+function toggleCollapse(id) {
+  const body  = document.getElementById('body-' + id);
+  const arrow = document.getElementById('arr-' + id);
+  if (!body) return;
+  const hidden = body.classList.toggle('hidden');
+  if (arrow) arrow.classList.toggle('open', !hidden);
+}
+
+// ── Auto-refresh countdown ────────────────────────────────────────────────────
+let countdown = 30;
+const msg = document.getElementById('auto-refresh-msg');
+const timer = setInterval(() => {
+  countdown--;
+  if (msg) msg.textContent = `Auto-refreshes in ${countdown}s`;
+  if (countdown <= 0) {
+    clearInterval(timer);
+    location.reload();
+  }
+}, 1000);
+</script>
 
 </body>
 </html>
