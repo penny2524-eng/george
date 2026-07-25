@@ -632,6 +632,7 @@ function check_deye() {
     }
 
     // Helper: extract battery fields from a device's own dataList
+    // Key names confirmed from live API probe on 2025-07-25
     $extractBat = function(array $dataList, string $sn): array {
         $kv2 = [];
         foreach ($dataList as $item) { $kv2[$item['key']] = $item['value']; }
@@ -641,50 +642,25 @@ function check_deye() {
             }
             return null;
         };
-        $result = [
-            'sn'     => $sn,
-            'soc'    => $b2(['SOC','BatterySOC','BatSOC','StateOfCharge','Battery_SOC',
-                             'Battery1SOC','Bat1SOC','BMS_BatterySOC1','SoC_of_battery_1']),
-            'soh'    => $b2(['SOH','BatterySOH','BatSOH','StateOfHealth','Battery_SOH',
-                             'Battery1SOH','Bat1SOH','BMS_BatteryHealth1','RatedCapacity']),
-            'volt'   => $b2(['Voltage','BatteryVoltage','BatVolt','Battery_Voltage','PackVoltage',
-                             'Battery1Voltage','Bat1Volt','BMS_BatteryVoltage1','BattVolt']),
-            'curr'   => $b2(['Current','BatteryCurrent','BatCurrent','Battery_Current','PackCurrent',
-                             'Battery1Current','Bat1Current','BMS_BatteryCurrent1','BattCurr']),
-            'power'  => $b2(['Power','BatteryPower','BatPower','Battery_Power',
-                             'Battery1Power','Bat1Power','BMS_BattPower1']),
-            'temp'   => $b2(['Temperature','BatteryTemperature','BatTemp','Battery_Temp','PackTemp',
-                             'Battery1Temp','Bat1Temp','BMS_BatteryTemp1','Temperature- Battery',
-                             'CellTemp','MaxCellTemp','AvgCellTemp','BattTemp']),
-            'cycles' => $b2(['CycleCount','ChargeCycles','BatteryChargeCycles','ChargeCount',
-                             'CycleTimes','TotalCycles','TotalChargingCycles','TotalChargeCount',
-                             'BMS_ChargingTimes','BatteryChargingTimes','BatCycleCount',
-                             'BatteryCycleCount','BatChargeCycles','BMS_CycleCount',
-                             'Charge_Cycle_Times','Total_Charge_Cycle_Times','BattCycle','BatCycle',
-                             'Battery1Cycles','Bat1Cycles','BMS_BatteryChargeCycles1','BMS_BattCycles1',
-                             'BatteryCycles','BatCycles']),
-            'status' => $b2(['Status','BatteryStatus','BatStatus','ChargeStatus','Battery_Status',
-                             'Battery1Status','Bat1Status','BMS_ChargeState1','ChargeState']),
+        return [
+            'sn'       => $sn,
+            'soc'      => $b2(['SOC','BatterySOC','BatSOC','Battery1SOC','Bat1SOC']),
+            'volt'     => $b2(['BatteryVoltage','Voltage','Battery1Voltage','Bat1Volt','BattVolt']),
+            'curr'     => $b2(['BatteryCurrent','Current','Battery1Current','Bat1Current','BattCurr']),
+            'power'    => $b2(['BatteryPower','Power','Battery1Power','Bat1Power','BattPower']),
+            'temp'     => $b2(['Temperature- Battery','BatteryTemperature','Battery1Temp',
+                               'Bat1Temp','BatteryTemp','Temperature','BatTemp']),
+            'rated_ah' => $b2(['BatteryRatedCapacity','RatedCapacity','BatteryCapacity','BatCapacity']),
+            // Cycle count and SoH are not exposed by the Deye Cloud API for this inverter model
         ];
-        // Dynamic fallback: scan all points for any key/name with "cycle"
-        if ($result['cycles'] === null) {
-            foreach ($dataList as $item) {
-                $k = strtolower($item['key']  ?? '');
-                $n = strtolower($item['name'] ?? '');
-                if ((str_contains($k, 'cycle') || str_contains($n, 'cycle'))
-                    && isset($item['value']) && $item['value'] !== '') {
-                    $result['cycles'] = (float)$item['value'];
-                    break;
-                }
-            }
-        }
-        return $result;
     };
 
     // Fetch per-device real-time data for ALL devices at once
     $extra = [
         'temp_bat' => null, 'temp_ac' => null, 'temp_dc' => null,
         'pv' => [], 'bat1' => [], 'bat2' => [],
+        'total_charge_kwh' => null, 'total_discharge_kwh' => null,
+        'daily_charge_kwh' => null, 'daily_discharge_kwh' => null,
     ];
     if ($allSns) {
         $devData    = $postJson($base.'/device/latest', ['deviceList' => $allSns]);
@@ -695,7 +671,7 @@ function check_deye() {
             $dataList = $devEntry['dataList']  ?? [];
 
             if ($sn === $invSn) {
-                // Inverter — extract temps and PV strings
+                // Inverter — extract temps, PV strings, and all battery metrics
                 $kv = [];
                 foreach ($dataList as $item) { $kv[$item['key']] = $item['value']; }
                 $bv = function(array $keys) use ($kv): ?float {
@@ -704,7 +680,7 @@ function check_deye() {
                     }
                     return null;
                 };
-                $extra['temp_bat'] = $bv(['Temperature- Battery','Battery1Temp','Bat1Temp','BMS_BatteryTemp1','BatteryTemp','BatTemp']);
+                $extra['temp_bat'] = $bv(['Temperature- Battery','BatteryTemp','BatTemp']);
                 $extra['temp_dc']  = $bv(['DC Temperature','DcTemp']);
                 $extra['temp_ac']  = $bv(['AC Temperature','AcTemp']);
                 foreach ([1, 2, 3] as $n) {
@@ -713,8 +689,14 @@ function check_deye() {
                     $w = (float)($kv["DCPowerPV$n"]   ?? 0);
                     if ($v > 0) $extra['pv'][] = ['n' => $n, 'v' => $v, 'a' => $a, 'w' => (int)$w];
                 }
-                // Inverter-level battery keys as fallback if no dedicated battery devices
-                $extra['_invBat'] = $extractBat($dataList, $sn);
+                // Energy throughput metrics (confirmed available from live API probe)
+                $fv = fn($k) => isset($kv[$k]) && $kv[$k] !== '' ? (float)$kv[$k] : null;
+                $extra['total_charge_kwh']    = $fv('TotalChargeEnergy');
+                $extra['total_discharge_kwh'] = $fv('TotalDischargeEnergy');
+                $extra['daily_charge_kwh']    = $fv('DailyChargingEnergy');
+                $extra['daily_discharge_kwh'] = $fv('DailyDischargingEnergy');
+                // Battery metrics reported by inverter (combined for both physical packs)
+                $extra['_invBat'] = $extractBat($dataList, '16903000D6120043');
             } else {
                 $batEntries[] = ['sn' => $sn, 'dl' => $dataList];
             }
@@ -730,10 +712,14 @@ function check_deye() {
             $extra['bat2'] = $extractBat($batEntries[1]['dl'], $batEntries[1]['sn']);
         }
 
-        // Fallback: if battery devices returned no data, use inverter-level battery fields
+        // Fallback: battery modules don't return data via /device/latest — use inverter-level fields
         $hasData = fn($b) => is_array($b) && array_filter($b, fn($v) => $v !== null && $v !== '') !== [];
         if (!$hasData($extra['bat1']) && $hasData($extra['_invBat'] ?? [])) {
             $extra['bat1'] = $extra['_invBat'];
+        }
+        // bat2: second physical pack — data is combined in inverter, show SN as placeholder
+        if (!$hasData($extra['bat2'])) {
+            $extra['bat2'] = ['sn' => '25407000E5140658'];
         }
         unset($extra['_invBat']);
     }
@@ -1842,16 +1828,14 @@ function renderDeye(d) {
         ${b && b.sn ? `<span style="font-size:.48rem;color:rgba(167,139,250,.3);font-family:'Courier New',monospace">${b.sn}</span>` : ''}
       </div>`;
 
-    const bsoc   = b.soc !== null && b.soc !== undefined ? Math.round(Number(b.soc)) : null;
+    const bsoc   = b.soc   != null ? Math.round(Number(b.soc))       : null;
     const col    = socBarCol(bsoc);
-    const bpow   = b.power !== null && b.power !== undefined ? Number(b.power) : null;
+    const bpow   = b.power != null ? Number(b.power)                 : null;
     const bdir   = bpow === null ? '' : bpow < -20 ? '↑ Chg' : bpow > 20 ? '↓ Dis' : 'Idle';
-    const bstat  = batStatusLabel(b.status);
-    const bsoh   = b.soh !== null && b.soh !== undefined ? Math.round(Number(b.soh)) : null;
-    const bcyc   = fmtCycles(b.cycles);
-    const bvolt  = b.volt  !== null && b.volt  !== undefined ? Number(b.volt).toFixed(1)  : null;
-    const bcurr  = b.curr  !== null && b.curr  !== undefined ? Number(b.curr).toFixed(1)  : null;
-    const btemp  = b.temp  !== null && b.temp  !== undefined ? Number(b.temp).toFixed(1)  : null;
+    const bvolt  = b.volt  != null ? Number(b.volt).toFixed(1)       : null;
+    const bcurr  = b.curr  != null ? Number(b.curr).toFixed(1)       : null;
+    const btemp  = b.temp  != null ? Number(b.temp).toFixed(1)       : null;
+    const bah    = b.rated_ah != null ? Math.round(Number(b.rated_ah)) : null;
     const btempCol = btemp === null ? '#fff' : Number(btemp) >= 45 ? '#ff4070' : Number(btemp) >= 35 ? '#ffcc00' : '#00ffcc';
 
     return `<div style="background:rgba(167,139,250,.08);border:1px solid rgba(167,139,250,.28);border-radius:8px;padding:.5rem .65rem">
@@ -1861,7 +1845,6 @@ function renderDeye(d) {
           ${b.sn ? `<div style="font-size:.48rem;color:rgba(167,139,250,.45);font-family:'Courier New',monospace;margin-top:.05rem">${b.sn}</div>` : ''}
         </div>
         <div style="display:flex;align-items:center;gap:.35rem">
-          ${bstat ? `<span style="font-size:.55rem;color:var(--muted);font-family:'Courier New',monospace">${bstat}</span>` : ''}
           ${bsoc !== null ? `<span style="font-size:.88rem;font-weight:800;font-family:'Courier New',monospace;color:${col};text-shadow:0 0 10px ${col}66">${bsoc}%</span>` : ''}
         </div>
       </div>
@@ -1872,30 +1855,55 @@ function renderDeye(d) {
         </div>
         ${bpow !== null ? `<div style="font-size:.54rem;color:var(--muted);font-family:'Courier New',monospace;margin-top:.12rem">${bdir} ${Math.abs(Math.round(bpow))} W</div>` : ''}
       </div>` : ''}
-      ${bsoh !== null ? `
-      <div style="margin-bottom:.32rem">
-        <div style="display:flex;justify-content:space-between;font-size:.52rem;color:var(--muted);font-family:'Courier New',monospace;margin-bottom:.15rem"><span>Health (SoH)</span><span>${bsoh}%</span></div>
-        <div style="height:3px;background:rgba(0,212,255,.1);border-radius:2px;overflow:hidden">
-          <div style="width:${bsoh}%;height:100%;background:${bsoh>=80?'#a78bfa':bsoh>=60?'#ffcc00':'#ff4070'};border-radius:2px"></div>
-        </div>
-      </div>` : ''}
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(52px,1fr));gap:.28rem;margin-top:.2rem">
-        ${bcyc  !== null ? miniStat('Cycles', bcyc,                     '#a78bfa') : ''}
-        ${bvolt !== null ? miniStat('Volt',   bvolt+' V',               '#fff')    : ''}
-        ${bcurr !== null ? miniStat('Curr',   bcurr+' A',               '#fff')    : ''}
-        ${btemp !== null ? miniStat('Temp',   btemp+'°C',               btempCol)  : ''}
-        ${bpow  !== null ? miniStat('Power',  Math.abs(Math.round(bpow))+' W', '#fff') : ''}
+        ${bvolt !== null ? miniStat('Volt',     bvolt+' V',             '#fff')    : ''}
+        ${bcurr !== null ? miniStat('Curr',     bcurr+' A',             '#fff')    : ''}
+        ${btemp !== null ? miniStat('Temp',     btemp+'°C',             btempCol)  : ''}
+        ${bpow  !== null ? miniStat('Power',    Math.abs(Math.round(bpow))+' W', '#fff') : ''}
+        ${bah   !== null ? miniStat('Capacity', bah+' Ah',              '#a78bfa') : ''}
       </div>
     </div>`;
   };
 
   const bat1 = d.bat1 ?? {};
   const bat2 = d.bat2 ?? {};
-  const hasBatDetail = [bat1, bat2].some(b => b && (b.sn || Object.entries(b).some(([k,v]) => k !== 'sn' && v !== null && v !== undefined)));
+  const hasBatDetail = [bat1, bat2].some(b => b && (b.sn || Object.entries(b).some(([k,v]) => k !== 'sn' && v != null)));
+
+  // Energy throughput section
+  const fmtKwh = v => v != null ? Number(v).toFixed(1)+' kWh' : null;
+  const tchg   = fmtKwh(d.total_charge_kwh);
+  const tdis   = fmtKwh(d.total_discharge_kwh);
+  const dchg   = fmtKwh(d.daily_charge_kwh);
+  const ddis   = fmtKwh(d.daily_discharge_kwh);
+  const hasEnergy = tchg || tdis || dchg || ddis;
+
+  const energyHtml = hasEnergy ? `
+    <div style="margin-top:.4rem;padding-top:.35rem;border-top:1px solid rgba(0,212,255,0.12)">
+      <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-family:'Courier New',monospace;margin-bottom:.35rem">Energy Throughput</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.3rem">
+        ${tchg ? `<div style="background:rgba(0,0,0,.2);border-radius:6px;padding:.3rem .4rem">
+          <div style="font-size:.48rem;color:var(--muted);font-family:'Courier New',monospace;text-transform:uppercase">Total Charged</div>
+          <div style="font-size:.72rem;font-weight:700;color:#34d399;font-family:'Courier New',monospace;margin-top:.08rem">↑ ${tchg}</div>
+        </div>` : ''}
+        ${tdis ? `<div style="background:rgba(0,0,0,.2);border-radius:6px;padding:.3rem .4rem">
+          <div style="font-size:.48rem;color:var(--muted);font-family:'Courier New',monospace;text-transform:uppercase">Total Discharged</div>
+          <div style="font-size:.72rem;font-weight:700;color:#f87171;font-family:'Courier New',monospace;margin-top:.08rem">↓ ${tdis}</div>
+        </div>` : ''}
+        ${dchg ? `<div style="background:rgba(0,0,0,.2);border-radius:6px;padding:.3rem .4rem">
+          <div style="font-size:.48rem;color:var(--muted);font-family:'Courier New',monospace;text-transform:uppercase">Today Charged</div>
+          <div style="font-size:.72rem;font-weight:700;color:#34d399;font-family:'Courier New',monospace;margin-top:.08rem">↑ ${dchg}</div>
+        </div>` : ''}
+        ${ddis ? `<div style="background:rgba(0,0,0,.2);border-radius:6px;padding:.3rem .4rem">
+          <div style="font-size:.48rem;color:var(--muted);font-family:'Courier New',monospace;text-transform:uppercase">Today Discharged</div>
+          <div style="font-size:.72rem;font-weight:700;color:#f87171;font-family:'Courier New',monospace;margin-top:.08rem">↓ ${ddis}</div>
+        </div>` : ''}
+      </div>
+    </div>` : '';
 
   const batDetailHtml = hasBatDetail ? `
     <div style="margin-top:.4rem;padding-top:.35rem;border-top:1px solid rgba(0,212,255,0.12)">
-      <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-family:'Courier New',monospace;margin-bottom:.35rem">Battery Detail</div>
+      <div style="font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-family:'Courier New',monospace;margin-bottom:.2rem">Battery Packs</div>
+      <div style="font-size:.5rem;color:rgba(255,255,255,.25);font-family:'Courier New',monospace;margin-bottom:.35rem">Metrics reported as combined by inverter · Cycle count &amp; SoH not exposed by API</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:.45rem">
         ${batMiniCard('Battery 1', bat1)}
         ${batMiniCard('Battery 2', bat2)}
@@ -1914,6 +1922,7 @@ function renderDeye(d) {
       </div>
     </div>
     ${batDetailHtml}
+    ${energyHtml}
     ${pvHtml}
     ${tempStatsHtml}
     <div style="font-size:.7rem;color:var(--muted);text-align:right;margin-top:.3rem">
