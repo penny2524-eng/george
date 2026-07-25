@@ -1778,8 +1778,7 @@ function renderDeye(d) {
     </div>`;
 
   const batMiniCard = (label, b) => {
-    if (!b || !Object.values(b).some(v => v !== null && v !== undefined)) return
-      `<div style="background:rgba(167,139,250,.05);border:1px solid rgba(167,139,250,.15);border-radius:8px;padding:.5rem .7rem;display:flex;align-items:center;justify-content:center">
+    if (!b || !Object.values(b).some(v => v !== null && v !== undefined)) return `<div style="background:rgba(167,139,250,.05);border:1px solid rgba(167,139,250,.15);border-radius:8px;padding:.5rem .7rem;display:flex;align-items:center;justify-content:center">
         <span style="font-size:.7rem;color:rgba(255,255,255,.2);font-family:'Courier New',monospace">${label} — no data</span>
       </div>`;
 
