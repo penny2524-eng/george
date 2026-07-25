@@ -616,68 +616,126 @@ function check_deye() {
 
     if (empty($st['success'])) return ['online' => false, 'error' => ($st['msg'] ?? 'no data')];
 
-    // Find inverter SN from device list
-    $invSn = null;
+    // Find inverter SN and collect all device SNs from device list
+    $invSn  = null;
+    $allSns = [];
     foreach ($dev['deviceListItems'] ?? [] as $d) {
-        if ($d['deviceType'] === 'INVERTER') { $invSn = $d['deviceSn']; break; }
+        $sn   = $d['deviceSn'] ?? null;
+        $type = strtolower($d['deviceType'] ?? '');
+        if (!$sn) continue;
+        $allSns[] = $sn;
+        if (str_contains($type, 'inverter')) $invSn = $sn;
+    }
+    // Always include the two physical battery module SNs visible in Deye Cloud
+    foreach (['16903000D6120043', '25407000E5140658'] as $batSn) {
+        if (!in_array($batSn, $allSns, true)) $allSns[] = $batSn;
     }
 
-    // Fetch per-device real-time data (temperatures, DC strings, battery detail)
+    // Helper: extract battery fields from a device's own dataList
+    $extractBat = function(array $dataList, string $sn): array {
+        $kv2 = [];
+        foreach ($dataList as $item) { $kv2[$item['key']] = $item['value']; }
+        $b2 = function(array $keys) use ($kv2): ?float {
+            foreach ($keys as $k) {
+                if (isset($kv2[$k]) && $kv2[$k] !== '') return (float)$kv2[$k];
+            }
+            return null;
+        };
+        $result = [
+            'sn'     => $sn,
+            'soc'    => $b2(['SOC','BatterySOC','BatSOC','StateOfCharge','Battery_SOC',
+                             'Battery1SOC','Bat1SOC','BMS_BatterySOC1','SoC_of_battery_1']),
+            'soh'    => $b2(['SOH','BatterySOH','BatSOH','StateOfHealth','Battery_SOH',
+                             'Battery1SOH','Bat1SOH','BMS_BatteryHealth1','RatedCapacity']),
+            'volt'   => $b2(['Voltage','BatteryVoltage','BatVolt','Battery_Voltage','PackVoltage',
+                             'Battery1Voltage','Bat1Volt','BMS_BatteryVoltage1','BattVolt']),
+            'curr'   => $b2(['Current','BatteryCurrent','BatCurrent','Battery_Current','PackCurrent',
+                             'Battery1Current','Bat1Current','BMS_BatteryCurrent1','BattCurr']),
+            'power'  => $b2(['Power','BatteryPower','BatPower','Battery_Power',
+                             'Battery1Power','Bat1Power','BMS_BattPower1']),
+            'temp'   => $b2(['Temperature','BatteryTemperature','BatTemp','Battery_Temp','PackTemp',
+                             'Battery1Temp','Bat1Temp','BMS_BatteryTemp1','Temperature- Battery',
+                             'CellTemp','MaxCellTemp','AvgCellTemp','BattTemp']),
+            'cycles' => $b2(['CycleCount','ChargeCycles','BatteryChargeCycles','ChargeCount',
+                             'CycleTimes','TotalCycles','TotalChargingCycles','TotalChargeCount',
+                             'BMS_ChargingTimes','BatteryChargingTimes','BatCycleCount',
+                             'BatteryCycleCount','BatChargeCycles','BMS_CycleCount',
+                             'Charge_Cycle_Times','Total_Charge_Cycle_Times','BattCycle','BatCycle',
+                             'Battery1Cycles','Bat1Cycles','BMS_BatteryChargeCycles1','BMS_BattCycles1',
+                             'BatteryCycles','BatCycles']),
+            'status' => $b2(['Status','BatteryStatus','BatStatus','ChargeStatus','Battery_Status',
+                             'Battery1Status','Bat1Status','BMS_ChargeState1','ChargeState']),
+        ];
+        // Dynamic fallback: scan all points for any key/name with "cycle"
+        if ($result['cycles'] === null) {
+            foreach ($dataList as $item) {
+                $k = strtolower($item['key']  ?? '');
+                $n = strtolower($item['name'] ?? '');
+                if ((str_contains($k, 'cycle') || str_contains($n, 'cycle'))
+                    && isset($item['value']) && $item['value'] !== '') {
+                    $result['cycles'] = (float)$item['value'];
+                    break;
+                }
+            }
+        }
+        return $result;
+    };
+
+    // Fetch per-device real-time data for ALL devices at once
     $extra = [
         'temp_bat' => null, 'temp_ac' => null, 'temp_dc' => null,
         'pv' => [], 'bat1' => [], 'bat2' => [],
     ];
-    if ($invSn) {
-        $devData  = $postJson($base.'/device/latest', ['deviceList' => [$invSn]]);
-        $dataList = $devData['deviceDataList'][0]['dataList'] ?? [];
-        $kv = [];
-        foreach ($dataList as $item) { $kv[$item['key']] = $item['value']; }
+    if ($allSns) {
+        $devData    = $postJson($base.'/device/latest', ['deviceList' => $allSns]);
+        $batEntries = []; // non-inverter device entries
 
-        // Try multiple key-name conventions across Deye firmware versions
-        $bv = function(array $keys) use ($kv): ?float {
-            foreach ($keys as $k) {
-                if (isset($kv[$k]) && $kv[$k] !== '') return (float)$kv[$k];
-            }
-            return null;
-        };
+        foreach ($devData['deviceDataList'] ?? [] as $devEntry) {
+            $sn       = $devEntry['deviceSn'] ?? '';
+            $dataList = $devEntry['dataList']  ?? [];
 
-        $extra['temp_bat'] = $bv(['Temperature- Battery','Battery1Temp','Bat1Temp','BMS_BatteryTemp1','BatteryTemp','BatTemp']);
-        $extra['temp_dc']  = $bv(['DC Temperature','DcTemp']);
-        $extra['temp_ac']  = $bv(['AC Temperature','AcTemp']);
-
-        // Battery 1 — all key aliases
-        $extra['bat1'] = [
-            'soc'    => $bv(['Battery1SOC','Bat1SOC','BMS_BatterySOC1','BMS_BattSOC1','BatterySOC','BatSOC','SoC_of_battery_1']),
-            'soh'    => $bv(['Battery1SOH','Bat1SOH','BMS_BatteryHealth1','BMS_BattHealth1','BatteryHealth','BatHealth']),
-            'volt'   => $bv(['Battery1Volt','Battery1Voltage','Bat1Volt','BMS_BatteryVoltage1','BMS_BattVolt1','BatteryVoltage','BatVolt']),
-            'curr'   => $bv(['Battery1Current','Bat1Current','BMS_BatteryCurrent1','BMS_BattCurr1','BatteryCurrent','BatCurrent']),
-            'power'  => $bv(['Battery1Power','Bat1Power','BMS_BattPower1','BatteryPower','BatPower']),
-            'temp'   => $bv(['Battery1Temp','Bat1Temp','BMS_BatteryTemp1','BMS_BattTemp1','Temperature- Battery','BatteryTemp','BatTemp']),
-            'cycles' => $bv(['Battery1Cycles','Bat1Cycles','BMS_BatteryChargeCycles1','BMS_BattCycles1','BatteryCycles','BatCycles']),
-            'status' => $bv(['Battery1Status','Bat1Status','BMS_ChargeState1','BMS_BattStatus1','BatteryStatus']),
-        ];
-
-        // Battery 2
-        $extra['bat2'] = [
-            'soc'    => $bv(['Battery2SOC','Bat2SOC','BMS_BatterySOC2','BMS_BattSOC2','SoC_of_battery_2']),
-            'soh'    => $bv(['Battery2SOH','Bat2SOH','BMS_BatteryHealth2','BMS_BattHealth2']),
-            'volt'   => $bv(['Battery2Volt','Battery2Voltage','Bat2Volt','BMS_BatteryVoltage2','BMS_BattVolt2']),
-            'curr'   => $bv(['Battery2Current','Bat2Current','BMS_BatteryCurrent2','BMS_BattCurr2']),
-            'power'  => $bv(['Battery2Power','Bat2Power','BMS_BattPower2']),
-            'temp'   => $bv(['Battery2Temp','Bat2Temp','BMS_BatteryTemp2','BMS_BattTemp2']),
-            'cycles' => $bv(['Battery2Cycles','Bat2Cycles','BMS_BatteryChargeCycles2','BMS_BattCycles2']),
-            'status' => $bv(['Battery2Status','Bat2Status','BMS_ChargeState2','BMS_BattStatus2']),
-        ];
-
-        // DC string data — include string only if voltage > 0
-        foreach ([1, 2, 3] as $n) {
-            $v = (float)($kv["DCVoltagePV$n"] ?? 0);
-            $a = (float)($kv["DCCurrentPV$n"] ?? 0);
-            $w = (float)($kv["DCPowerPV$n"]   ?? 0);
-            if ($v > 0) {
-                $extra['pv'][] = ['n' => $n, 'v' => $v, 'a' => $a, 'w' => (int)$w];
+            if ($sn === $invSn) {
+                // Inverter — extract temps and PV strings
+                $kv = [];
+                foreach ($dataList as $item) { $kv[$item['key']] = $item['value']; }
+                $bv = function(array $keys) use ($kv): ?float {
+                    foreach ($keys as $k) {
+                        if (isset($kv[$k]) && $kv[$k] !== '') return (float)$kv[$k];
+                    }
+                    return null;
+                };
+                $extra['temp_bat'] = $bv(['Temperature- Battery','Battery1Temp','Bat1Temp','BMS_BatteryTemp1','BatteryTemp','BatTemp']);
+                $extra['temp_dc']  = $bv(['DC Temperature','DcTemp']);
+                $extra['temp_ac']  = $bv(['AC Temperature','AcTemp']);
+                foreach ([1, 2, 3] as $n) {
+                    $v = (float)($kv["DCVoltagePV$n"] ?? 0);
+                    $a = (float)($kv["DCCurrentPV$n"] ?? 0);
+                    $w = (float)($kv["DCPowerPV$n"]   ?? 0);
+                    if ($v > 0) $extra['pv'][] = ['n' => $n, 'v' => $v, 'a' => $a, 'w' => (int)$w];
+                }
+                // Inverter-level battery keys as fallback if no dedicated battery devices
+                $extra['_invBat'] = $extractBat($dataList, $sn);
+            } else {
+                $batEntries[] = ['sn' => $sn, 'dl' => $dataList];
             }
         }
+
+        // Sort battery devices by SN for deterministic ordering
+        usort($batEntries, fn($a, $b) => strcmp($a['sn'], $b['sn']));
+
+        if (isset($batEntries[0])) {
+            $extra['bat1'] = $extractBat($batEntries[0]['dl'], $batEntries[0]['sn']);
+        }
+        if (isset($batEntries[1])) {
+            $extra['bat2'] = $extractBat($batEntries[1]['dl'], $batEntries[1]['sn']);
+        }
+
+        // Fallback: if battery devices returned no data, use inverter-level battery fields
+        $hasData = fn($b) => is_array($b) && array_filter($b, fn($v) => $v !== null && $v !== '') !== [];
+        if (!$hasData($extra['bat1']) && $hasData($extra['_invBat'] ?? [])) {
+            $extra['bat1'] = $extra['_invBat'];
+        }
+        unset($extra['_invBat']);
     }
 
     return array_merge([
@@ -1778,8 +1836,10 @@ function renderDeye(d) {
     </div>`;
 
   const batMiniCard = (label, b) => {
-    if (!b || !Object.values(b).some(v => v !== null && v !== undefined)) return `<div style="background:rgba(167,139,250,.05);border:1px solid rgba(167,139,250,.15);border-radius:8px;padding:.5rem .7rem;display:flex;align-items:center;justify-content:center">
+    const hasMetrics = b && Object.entries(b).some(([k,v]) => k !== 'sn' && v !== null && v !== undefined);
+    if (!hasMetrics) return `<div style="background:rgba(167,139,250,.05);border:1px solid rgba(167,139,250,.15);border-radius:8px;padding:.5rem .7rem;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:.2rem">
         <span style="font-size:.7rem;color:rgba(255,255,255,.2);font-family:'Courier New',monospace">${label} — no data</span>
+        ${b && b.sn ? `<span style="font-size:.48rem;color:rgba(167,139,250,.3);font-family:'Courier New',monospace">${b.sn}</span>` : ''}
       </div>`;
 
     const bsoc   = b.soc !== null && b.soc !== undefined ? Math.round(Number(b.soc)) : null;
@@ -1796,7 +1856,10 @@ function renderDeye(d) {
 
     return `<div style="background:rgba(167,139,250,.08);border:1px solid rgba(167,139,250,.28);border-radius:8px;padding:.5rem .65rem">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.3rem">
-        <div style="font-size:.62rem;font-weight:700;color:#a78bfa;font-family:'Courier New',monospace">🔋 ${label}</div>
+        <div>
+          <div style="font-size:.62rem;font-weight:700;color:#a78bfa;font-family:'Courier New',monospace">🔋 ${label}</div>
+          ${b.sn ? `<div style="font-size:.48rem;color:rgba(167,139,250,.45);font-family:'Courier New',monospace;margin-top:.05rem">${b.sn}</div>` : ''}
+        </div>
         <div style="display:flex;align-items:center;gap:.35rem">
           ${bstat ? `<span style="font-size:.55rem;color:var(--muted);font-family:'Courier New',monospace">${bstat}</span>` : ''}
           ${bsoc !== null ? `<span style="font-size:.88rem;font-weight:800;font-family:'Courier New',monospace;color:${col};text-shadow:0 0 10px ${col}66">${bsoc}%</span>` : ''}
@@ -1828,7 +1891,7 @@ function renderDeye(d) {
 
   const bat1 = d.bat1 ?? {};
   const bat2 = d.bat2 ?? {};
-  const hasBatDetail = [bat1, bat2].some(b => b && Object.values(b).some(v => v !== null && v !== undefined));
+  const hasBatDetail = [bat1, bat2].some(b => b && (b.sn || Object.entries(b).some(([k,v]) => k !== 'sn' && v !== null && v !== undefined)));
 
   const batDetailHtml = hasBatDetail ? `
     <div style="margin-top:.4rem;padding-top:.35rem;border-top:1px solid rgba(0,212,255,0.12)">
