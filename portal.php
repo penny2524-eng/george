@@ -1844,8 +1844,15 @@ function renderDeye(d) {
           <div style="font-size:.62rem;font-weight:700;color:#a78bfa;font-family:'Courier New',monospace">🔋 ${label}</div>
           ${b.sn ? `<div style="font-size:.48rem;color:rgba(167,139,250,.45);font-family:'Courier New',monospace;margin-top:.05rem">${b.sn}</div>` : ''}
         </div>
-        <div style="display:flex;align-items:center;gap:.35rem">
-          ${bsoc !== null ? `<span style="font-size:.88rem;font-weight:800;font-family:'Courier New',monospace;color:${col};text-shadow:0 0 10px ${col}66">${bsoc}%</span>` : ''}
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <div style="text-align:right">
+            <div style="font-size:.42rem;color:var(--muted);font-family:'Courier New',monospace;text-transform:uppercase">SOH</div>
+            <div style="font-size:.7rem;font-weight:700;font-family:'Courier New',monospace;color:rgba(255,255,255,.25)">—</div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:.42rem;color:var(--muted);font-family:'Courier New',monospace;text-transform:uppercase">SOC</div>
+            ${bsoc !== null ? `<div style="font-size:.88rem;font-weight:800;font-family:'Courier New',monospace;color:${col};text-shadow:0 0 10px ${col}66">${bsoc}%</div>` : '<div style="font-size:.7rem;color:rgba(255,255,255,.25);font-family:\'Courier New\',monospace">—</div>'}
+          </div>
         </div>
       </div>
       ${bsoc !== null ? `
